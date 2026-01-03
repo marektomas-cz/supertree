@@ -1,0 +1,74 @@
+use crate::db::DbError;
+use serde::Serialize;
+use sqlx::SqlitePool;
+
+pub const KEY_DEFAULT_MODEL: &str = "default_model";
+pub const KEY_REVIEW_MODEL: &str = "review_model";
+pub const KEY_REVIEW_THINKING_LEVEL: &str = "review_thinking_level";
+pub const KEY_CLAUDE_PERMISSION_MODE: &str = "claude_permission_mode";
+pub const KEY_ENV_VARS: &str = "env_vars";
+pub const KEY_WORKSPACES_ROOT: &str = "workspaces_root";
+
+const DEFAULT_SETTINGS: &[(&str, &str)] = &[
+  (KEY_DEFAULT_MODEL, "gpt-5-codex"),
+  (KEY_REVIEW_MODEL, "gpt-5-codex"),
+  (KEY_REVIEW_THINKING_LEVEL, "medium"),
+  (KEY_CLAUDE_PERMISSION_MODE, "default"),
+  (KEY_ENV_VARS, ""),
+  (KEY_WORKSPACES_ROOT, ""),
+];
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct SettingEntry {
+  pub key: String,
+  pub value: String,
+}
+
+pub async fn ensure_defaults(pool: &SqlitePool) -> Result<(), DbError> {
+  for (key, value) in DEFAULT_SETTINGS {
+    sqlx::query(
+      "INSERT INTO settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO NOTHING",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+  }
+  Ok(())
+}
+
+pub async fn list_settings(pool: &SqlitePool) -> Result<Vec<SettingEntry>, DbError> {
+  let rows = sqlx::query_as::<_, SettingEntry>("SELECT key, value FROM settings ORDER BY key")
+    .fetch_all(pool)
+    .await?;
+  Ok(rows)
+}
+
+pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> Result<(), DbError> {
+  sqlx::query(
+    "INSERT INTO settings (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+  )
+  .bind(key)
+  .bind(value)
+  .execute(pool)
+  .await?;
+  Ok(())
+}
+
+pub async fn get_setting(pool: &SqlitePool, key: &str) -> Result<Option<String>, DbError> {
+  let value = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+  Ok(value)
+}
+
+pub async fn get_env_vars(pool: &SqlitePool) -> Result<String, DbError> {
+  Ok(get_setting(pool, KEY_ENV_VARS).await?.unwrap_or_default())
+}
+
+pub async fn set_env_vars(pool: &SqlitePool, value: &str) -> Result<(), DbError> {
+  set_setting(pool, KEY_ENV_VARS, value).await
+}
