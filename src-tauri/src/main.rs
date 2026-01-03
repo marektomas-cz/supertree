@@ -1,10 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod db;
+mod git;
 mod paths;
+mod repos;
 mod settings;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -13,7 +16,9 @@ use std::time::Duration;
 use tauri::Manager;
 
 use crate::db::Database;
-use crate::paths::{AppPaths, ensure_dirs, resolve_paths};
+use crate::git::{clone_repo, inspect_repo, is_git_repo, read_supertree_config, repo_name_from_url};
+use crate::paths::{ensure_dirs, resolve_paths, AppPaths};
+use crate::repos::{NewRepo, RepoRecord};
 use crate::settings::SettingEntry;
 
 #[tauri::command]
@@ -26,6 +31,22 @@ fn hello(name: String) -> String {
 struct AppInfo {
   version: String,
   paths: AppPaths,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum AddRepoRequest {
+  Local { path: String },
+  Clone { url: String, destination: Option<String> },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum OpenTarget {
+  System,
+  Vscode,
+  Cursor,
+  Zed,
 }
 
 #[allow(non_snake_case)]
@@ -71,6 +92,199 @@ async fn setEnvVars(db: tauri::State<'_, Database>, value: String) -> Result<(),
   settings::set_env_vars(db.pool(), &value)
     .await
     .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn listRepos(db: tauri::State<'_, Database>) -> Result<Vec<RepoRecord>, String> {
+  repos::list_repos(db.pool())
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn addRepo(
+  db: tauri::State<'_, Database>,
+  paths: tauri::State<'_, AppPaths>,
+  payload: AddRepoRequest,
+) -> Result<RepoRecord, String> {
+  let repo_path = match payload {
+    AddRepoRequest::Local { path } => {
+      let candidate = PathBuf::from(path.trim());
+      if !candidate.exists() {
+        return Err(format!("Path does not exist: {}", candidate.display()));
+      }
+      if !candidate.is_dir() {
+        return Err(format!("Path is not a directory: {}", candidate.display()));
+      }
+      let is_repo = is_git_repo(&candidate).map_err(|err| err.to_string())?;
+      if !is_repo {
+        return Err("Selected path is not a git repository".to_string());
+      }
+      candidate
+    }
+    AddRepoRequest::Clone { url, destination } => {
+      let target_dir = match destination {
+        Some(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
+        _ => paths.workspaces_dir.join(repo_name_from_url(&url)),
+      };
+      if target_dir.exists() {
+        return Err(format!(
+          "Clone destination already exists: {}",
+          target_dir.display()
+        ));
+      }
+      if let Some(parent) = target_dir.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+      }
+      clone_repo(&url, &target_dir).map_err(|err| err.to_string())?;
+      target_dir
+    }
+  };
+
+  let identity = inspect_repo(&repo_path).map_err(|err| err.to_string())?;
+  let scripts = read_supertree_config(&identity.root_path)
+    .map_err(|err| err.to_string())?
+    .unwrap_or_default();
+
+  let new_repo = NewRepo {
+    name: identity.name,
+    root_path: identity.root_path.to_string_lossy().to_string(),
+    remote_url: identity.remote_url,
+    default_branch: identity.default_branch,
+    scripts_setup: scripts.setup,
+    scripts_run: scripts.run,
+    scripts_archive: scripts.archive,
+    run_script_mode: scripts.run_script_mode,
+  };
+
+  repos::insert_repo(db.pool(), new_repo)
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn removeRepo(
+  db: tauri::State<'_, Database>,
+  paths: tauri::State<'_, AppPaths>,
+  repo_id: String,
+) -> Result<(), String> {
+  let workspace_root = paths
+    .workspaces_dir
+    .canonicalize()
+    .unwrap_or_else(|_| paths.workspaces_dir.clone());
+  let workspace_paths = repos::list_workspace_paths(db.pool(), &repo_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  for workspace_path in workspace_paths {
+    let candidate = PathBuf::from(&workspace_path);
+    let resolved = candidate
+      .canonicalize()
+      .unwrap_or_else(|_| candidate.clone());
+    if !resolved.starts_with(&workspace_root) {
+      return Err(format!(
+        "Refusing to delete workspace outside managed directory: {}",
+        resolved.display()
+      ));
+    }
+    if resolved.exists() {
+      fs::remove_dir_all(&resolved).map_err(|err| err.to_string())?;
+    }
+  }
+  repos::delete_repo(db.pool(), &repo_id)
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+fn openPathIn(path: String, target: OpenTarget) -> Result<(), String> {
+  let path = PathBuf::from(path);
+  if !path.exists() {
+    return Err(format!("Path does not exist: {}", path.display()));
+  }
+
+  let mut command = if cfg!(target_os = "windows") {
+    match target {
+      OpenTarget::System => {
+        let mut cmd = Command::new("explorer");
+        cmd.arg(&path);
+        cmd
+      }
+      OpenTarget::Vscode => {
+        let mut cmd = Command::new("code");
+        cmd.arg(&path);
+        cmd
+      }
+      OpenTarget::Cursor => {
+        let mut cmd = Command::new("cursor");
+        cmd.arg(&path);
+        cmd
+      }
+      OpenTarget::Zed => {
+        let mut cmd = Command::new("zed");
+        cmd.arg(&path);
+        cmd
+      }
+    }
+  } else if cfg!(target_os = "macos") {
+    match target {
+      OpenTarget::System => {
+        let mut cmd = Command::new("open");
+        cmd.arg(&path);
+        cmd
+      }
+      OpenTarget::Vscode => {
+        let mut cmd = Command::new("open");
+        cmd.arg("-a").arg("Visual Studio Code").arg(&path);
+        cmd
+      }
+      OpenTarget::Cursor => {
+        let mut cmd = Command::new("open");
+        cmd.arg("-a").arg("Cursor").arg(&path);
+        cmd
+      }
+      OpenTarget::Zed => {
+        let mut cmd = Command::new("open");
+        cmd.arg("-a").arg("Zed").arg(&path);
+        cmd
+      }
+    }
+  } else {
+    match target {
+      OpenTarget::System => {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(&path);
+        cmd
+      }
+      OpenTarget::Vscode => {
+        let mut cmd = Command::new("code");
+        cmd.arg(&path);
+        cmd
+      }
+      OpenTarget::Cursor => {
+        let mut cmd = Command::new("cursor");
+        cmd.arg(&path);
+        cmd
+      }
+      OpenTarget::Zed => {
+        let mut cmd = Command::new("zed");
+        cmd.arg(&path);
+        cmd
+      }
+    }
+  };
+
+  let status = command.status().map_err(|err| err.to_string())?;
+  if !status.success() {
+    return Err(format!(
+      "Open command failed with exit code {:?}",
+      status.code()
+    ));
+  }
+  Ok(())
 }
 
 struct SidecarProcess {
@@ -180,7 +394,11 @@ fn main() {
       listSettings,
       setSetting,
       getEnvVars,
-      setEnvVars
+      setEnvVars,
+      listRepos,
+      addRepo,
+      removeRepo,
+      openPathIn
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

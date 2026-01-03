@@ -20,6 +20,10 @@ pub enum DbError {
   Migrate(sqlx::migrate::MigrateError),
   /// The database path was invalid or missing.
   InvalidPath(String),
+  /// A record already exists and cannot be created again.
+  Conflict(String),
+  /// A requested record does not exist.
+  NotFound(String),
 }
 
 impl fmt::Display for DbError {
@@ -28,6 +32,8 @@ impl fmt::Display for DbError {
       DbError::Sqlx(err) => write!(f, "Database error: {err}"),
       DbError::Migrate(err) => write!(f, "Database migration error: {err}"),
       DbError::InvalidPath(message) => write!(f, "Database path error: {message}"),
+      DbError::Conflict(message) => write!(f, "Database conflict: {message}"),
+      DbError::NotFound(message) => write!(f, "Database not found: {message}"),
     }
   }
 }
@@ -38,6 +44,8 @@ impl std::error::Error for DbError {
       DbError::Sqlx(err) => Some(err),
       DbError::Migrate(err) => Some(err),
       DbError::InvalidPath(_) => None,
+      DbError::Conflict(_) => None,
+      DbError::NotFound(_) => None,
     }
   }
 }
