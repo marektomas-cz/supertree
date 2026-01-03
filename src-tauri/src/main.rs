@@ -318,6 +318,7 @@ async fn createWorkspace(
 #[tauri::command]
 async fn archiveWorkspace(
   db: tauri::State<'_, Database>,
+  paths: tauri::State<'_, AppPaths>,
   workspace_id: String,
   allow_script: bool,
 ) -> Result<(), String> {
@@ -332,6 +333,21 @@ async fn archiveWorkspace(
     .await
     .map_err(|err| err.to_string())?;
   let workspace_path = PathBuf::from(&workspace_record.path);
+  let workspace_root = paths
+    .workspaces_dir
+    .canonicalize()
+    .map_err(|err| format!("Cannot resolve workspaces root: {err}"))?;
+  let resolved_workspace = match workspace_path.canonicalize() {
+    Ok(path) => path,
+    Err(_err) if !workspace_path.exists() => workspace_path.clone(),
+    Err(err) => return Err(format!("Cannot resolve workspace path: {err}")),
+  };
+  if !resolved_workspace.starts_with(&workspace_root) {
+    return Err(format!(
+      "Refusing to delete workspace outside managed directory: {}",
+      resolved_workspace.display()
+    ));
+  }
   if let Some(script) = repo
     .scripts_archive
     .as_ref()
