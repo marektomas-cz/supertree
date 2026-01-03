@@ -34,7 +34,7 @@ export default function AppShell() {
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
   const [workspaceMenuId, setWorkspaceMenuId] = useState<string | null>(null);
-  const [workspaceMenuEl, setWorkspaceMenuEl] = useState<HTMLDivElement | null>(null);
+  const workspaceMenuRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const [createWorkspaceOpen, setCreateWorkspaceOpen] = useState(false);
   const [createWorkspaceMode, setCreateWorkspaceMode] = useState<'default' | 'branch'>(
     'default',
@@ -46,6 +46,12 @@ export default function AppShell() {
   >('idle');
   const [createWorkspaceError, setCreateWorkspaceError] = useState<string | null>(null);
   const createWorkspaceRef = useRef<HTMLDivElement>(null);
+  const [archiveConfirmOpen, setArchiveConfirmOpen] = useState(false);
+  const [archiveConfirmWorkspace, setArchiveConfirmWorkspace] = useState<WorkspaceInfo | null>(
+    null,
+  );
+  const [archiveConfirmScript, setArchiveConfirmScript] = useState<string | null>(null);
+  const archiveConfirmRef = useRef<HTMLDivElement>(null);
 
   const selectedRepo = useMemo(
     () => repos.find((repo) => repo.id === selectedRepoId) ?? null,
@@ -263,12 +269,12 @@ export default function AppShell() {
     }
   };
 
-  const handleArchiveWorkspace = async (workspaceId: string) => {
+  const handleArchiveWorkspace = async (workspace: WorkspaceInfo, allowScript: boolean) => {
     setWorkspaceError(null);
     try {
-      await invoke('archiveWorkspace', { workspaceId });
+      await invoke('archiveWorkspace', { workspaceId: workspace.id, allowScript });
       await loadWorkspaces();
-      if (selectedWorkspaceId === workspaceId) {
+      if (selectedWorkspaceId === workspace.id) {
         setSelectedWorkspaceId(null);
         setActiveView('workspaces');
       }
@@ -315,6 +321,33 @@ export default function AppShell() {
     }
   };
 
+  const requestArchiveWorkspace = (workspace: WorkspaceInfo) => {
+    const repo = repos.find((item) => item.id === workspace.repoId);
+    const script = repo?.scriptsArchive?.trim();
+    if (script) {
+      setArchiveConfirmWorkspace(workspace);
+      setArchiveConfirmScript(script);
+      setArchiveConfirmOpen(true);
+      return;
+    }
+    void handleArchiveWorkspace(workspace, false);
+  };
+
+  const closeArchiveConfirm = useCallback(() => {
+    setArchiveConfirmOpen(false);
+    setArchiveConfirmWorkspace(null);
+    setArchiveConfirmScript(null);
+  }, []);
+
+  const confirmArchiveWorkspace = async () => {
+    if (!archiveConfirmWorkspace) {
+      return;
+    }
+    const target = archiveConfirmWorkspace;
+    closeArchiveConfirm();
+    await handleArchiveWorkspace(target, true);
+  };
+
   const closeAddRepo = useCallback(() => {
     setAddRepoOpen(false);
     setAddError(null);
@@ -333,6 +366,27 @@ export default function AppShell() {
     () => repos.find((repo) => repo.id === createWorkspaceRepoId) ?? null,
     [createWorkspaceRepoId, repos],
   );
+  const archiveConfirmRepo = useMemo(() => {
+    if (!archiveConfirmWorkspace) {
+      return null;
+    }
+    return repos.find((repo) => repo.id === archiveConfirmWorkspace.repoId) ?? null;
+  }, [archiveConfirmWorkspace, repos]);
+  const headerTitle = useMemo(() => {
+    switch (activeView) {
+      case 'settings':
+        return 'Settings';
+      case 'repo':
+        return selectedRepo?.name ?? 'Repository';
+      case 'workspace':
+        return selectedWorkspace?.branch ?? 'Workspace';
+      case 'workspaces':
+        return 'Workspaces';
+      case 'home':
+      default:
+        return 'Home';
+    }
+  }, [activeView, selectedRepo, selectedWorkspace]);
 
   useEffect(() => {
     if (!addRepoOpen) {
@@ -437,14 +491,63 @@ export default function AppShell() {
   }, [closeCreateWorkspace, createWorkspaceOpen]);
 
   useEffect(() => {
-    if (!workspaceMenuId) {
-      if (workspaceMenuEl !== null) {
-        setWorkspaceMenuEl(null);
+    if (!archiveConfirmOpen) {
+      return;
+    }
+    const modal = archiveConfirmRef.current;
+    if (!modal) {
+      return;
+    }
+
+    const getFocusable = () =>
+      Array.from(
+        modal.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hasAttribute('disabled'));
+
+    const focusables = getFocusable();
+    if (focusables.length > 0) {
+      focusables[0].focus();
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeArchiveConfirm();
+        return;
       }
+      if (event.key !== 'Tab') {
+        return;
+      }
+      const items = getFocusable();
+      if (items.length === 0) {
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [archiveConfirmOpen, closeArchiveConfirm]);
+
+  useEffect(() => {
+    if (!workspaceMenuId) {
       return;
     }
     const handleClickOutside = (event: MouseEvent) => {
-      if (workspaceMenuEl && !workspaceMenuEl.contains(event.target as Node)) {
+      const menuEl = workspaceMenuRefs.current[workspaceMenuId] ?? null;
+      if (menuEl && !menuEl.contains(event.target as Node)) {
         setWorkspaceMenuId(null);
       }
     };
@@ -459,7 +562,7 @@ export default function AppShell() {
       document.removeEventListener('mousedown', handleClickOutside);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [workspaceMenuEl, workspaceMenuId]);
+  }, [workspaceMenuId]);
 
   return (
     <>
@@ -553,9 +656,7 @@ export default function AppShell() {
                                     <div
                                       className="relative"
                                       ref={(node) => {
-                                        if (workspace.id === workspaceMenuId) {
-                                          setWorkspaceMenuEl(node);
-                                        }
+                                        workspaceMenuRefs.current[workspace.id] = node;
                                       }}
                                     >
                                       <button
@@ -588,7 +689,7 @@ export default function AppShell() {
                                             type="button"
                                             onClick={() => {
                                               setWorkspaceMenuId(null);
-                                              void handleArchiveWorkspace(workspace.id);
+                                              requestArchiveWorkspace(workspace);
                                             }}
                                             className="w-full rounded-md px-3 py-2 text-left text-slate-200 hover:bg-slate-900"
                                           >
@@ -636,15 +737,7 @@ export default function AppShell() {
         <main className="flex h-full flex-col">
           <div className="flex items-center gap-4 border-b border-slate-800 px-6 py-3">
             <div className="text-sm font-medium">
-              {activeView === 'settings'
-                ? 'Settings'
-                : activeView === 'repo'
-                  ? selectedRepo?.name ?? 'Repository'
-                  : activeView === 'workspace'
-                    ? selectedWorkspace?.branch ?? 'Workspace'
-                    : activeView === 'workspaces'
-                      ? 'Workspaces'
-                  : 'Home'}
+              {headerTitle}
             </div>
             {activeView === 'home' ? <div className="text-sm text-slate-500">Chat 1</div> : null}
           </div>
@@ -685,7 +778,7 @@ export default function AppShell() {
                 <WorkspacePage
                   workspace={selectedWorkspace}
                   repo={selectedWorkspaceRepo}
-                  onArchive={() => handleArchiveWorkspace(selectedWorkspace.id)}
+                  onArchive={() => requestArchiveWorkspace(selectedWorkspace)}
                   onUnarchive={() => handleUnarchiveWorkspace(selectedWorkspace.id)}
                 />
               ) : (
@@ -742,6 +835,70 @@ export default function AppShell() {
           </div>
         </aside>
       </div>
+
+      {archiveConfirmOpen && archiveConfirmWorkspace ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-6">
+          <div
+            ref={archiveConfirmRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="archive-workspace-title"
+            className="w-full max-w-lg rounded-lg border border-slate-800 bg-slate-950 p-6 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                  Workspace
+                </div>
+                <h2 id="archive-workspace-title" className="mt-2 text-xl font-semibold">
+                  Archive workspace
+                </h2>
+                <div className="mt-1 text-xs text-slate-400">
+                  {archiveConfirmRepo?.name ?? 'Unknown repository'} -{' '}
+                  {archiveConfirmWorkspace.branch}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={closeArchiveConfirm}
+                className="text-sm text-slate-400 hover:text-slate-100"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-3 text-sm text-slate-300">
+              <p>
+                This repository defines an archive script. Review it before continuing. The
+                script runs inside the workspace and can modify files.
+              </p>
+              {archiveConfirmScript ? (
+                <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                  The script below will run if you confirm.
+                </div>
+              ) : null}
+            </div>
+
+            {archiveConfirmScript ? (
+              <div className="mt-4 rounded-md border border-slate-800 bg-slate-900/60 p-3">
+                <div className="text-[10px] uppercase tracking-widest text-slate-500">
+                  Archive script
+                </div>
+                <pre className="mt-2 whitespace-pre-wrap text-xs text-slate-200">
+                  {archiveConfirmScript}
+                </pre>
+              </div>
+            ) : null}
+
+            <div className="mt-6 flex items-center justify-end gap-2">
+              <Button variant="outline" onClick={closeArchiveConfirm}>
+                Cancel
+              </Button>
+              <Button onClick={confirmArchiveWorkspace}>Archive and run script</Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {createWorkspaceOpen ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-6">

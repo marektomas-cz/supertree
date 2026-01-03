@@ -106,7 +106,7 @@ pub async fn find_active_workspace_for_branch(
 }
 
 pub async fn insert_workspace(pool: &SqlitePool, new_workspace: NewWorkspace) -> Result<WorkspaceRecord, DbError> {
-  sqlx::query(
+  let result = sqlx::query(
     "INSERT INTO workspaces
       (id, repo_id, branch, directory_name, path, state, base_port)
      VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -119,7 +119,17 @@ pub async fn insert_workspace(pool: &SqlitePool, new_workspace: NewWorkspace) ->
   .bind(&new_workspace.state)
   .bind(new_workspace.base_port)
   .execute(pool)
-  .await?;
+  .await;
+  match result {
+    Ok(_) => {}
+    Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+      return Err(DbError::Conflict(format!(
+        "Workspace already exists for branch {}",
+        new_workspace.branch
+      )));
+    }
+    Err(err) => return Err(err.into()),
+  }
 
   get_workspace(pool, &new_workspace.id).await
 }

@@ -16,7 +16,7 @@ export default function WorkspacePage({
   onUnarchive,
 }: WorkspacePageProps) {
   const basePort = workspace.basePort;
-  const portRange = basePort !== null && basePort !== undefined ? `${basePort}-${basePort + 9}` : 'Not assigned';
+  const portRange = basePort != null ? `${basePort}-${basePort + 9}` : 'Not assigned';
 
   return (
     <div className="flex h-full flex-col gap-6">

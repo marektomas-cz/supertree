@@ -315,6 +315,7 @@ async fn createWorkspace(
 async fn archiveWorkspace(
   db: tauri::State<'_, Database>,
   workspace_id: String,
+  allow_script: bool,
 ) -> Result<(), String> {
   let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
     .await
@@ -332,6 +333,9 @@ async fn archiveWorkspace(
     .as_ref()
     .filter(|value| !value.trim().is_empty())
   {
+    if !allow_script {
+      return Err("Archive script requires confirmation.".to_string());
+    }
     run_workspace_script(script, &workspace_path, workspace_record.base_port)?;
   }
 

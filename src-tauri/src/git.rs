@@ -202,7 +202,15 @@ pub fn branch_exists(path: &Path, branch: &str) -> Result<bool, GitError> {
 pub fn create_worktree(repo_path: &Path, workspace_path: &Path, branch: &str) -> Result<(), GitError> {
   let repo_str = repo_path.to_str().ok_or(GitError::InvalidUtf8)?;
   let workspace_str = workspace_path.to_str().ok_or(GitError::InvalidUtf8)?;
-  run_git(&["-C", repo_str, "worktree", "add", workspace_str, branch])?;
+  run_git(&[
+    "-C",
+    repo_str,
+    "worktree",
+    "add",
+    "--no-track",
+    workspace_str,
+    branch,
+  ])?;
   Ok(())
 }
 
@@ -210,14 +218,7 @@ pub fn create_worktree(repo_path: &Path, workspace_path: &Path, branch: &str) ->
 pub fn remove_worktree(repo_path: &Path, workspace_path: &Path) -> Result<(), GitError> {
   let repo_str = repo_path.to_str().ok_or(GitError::InvalidUtf8)?;
   let workspace_str = workspace_path.to_str().ok_or(GitError::InvalidUtf8)?;
-  run_git(&[
-    "-C",
-    repo_str,
-    "worktree",
-    "remove",
-    "--force",
-    workspace_str,
-  ])?;
+  run_git(&["-C", repo_str, "worktree", "remove", workspace_str])?;
   Ok(())
 }
 
