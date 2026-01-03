@@ -4,6 +4,9 @@ import { Button } from '@/components/ui/button';
 import { formatGreeting } from '@/lib/format';
 import SettingsPage from './SettingsPage';
 
+/**
+ * Top-level shell layout with left navigation and main content area.
+ */
 export default function AppShell() {
   const [activeView, setActiveView] = useState<'workspace' | 'settings'>('settings');
   const [greeting, setGreeting] = useState<string>(formatGreeting('Supertree'));

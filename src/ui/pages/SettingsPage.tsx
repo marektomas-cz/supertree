@@ -29,6 +29,9 @@ const sections = [
   'Experimental',
 ];
 
+/**
+ * Settings view with Env editor and app path diagnostics.
+ */
 export default function SettingsPage() {
   const [activeSection, setActiveSection] = useState('Env');
   const [envVars, setEnvVars] = useState('');

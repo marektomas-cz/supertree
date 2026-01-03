@@ -2,11 +2,17 @@ use crate::db::DbError;
 use serde::Serialize;
 use sqlx::SqlitePool;
 
+/// Settings key for the default chat model.
 pub const KEY_DEFAULT_MODEL: &str = "default_model";
+/// Settings key for the review model.
 pub const KEY_REVIEW_MODEL: &str = "review_model";
+/// Settings key for the review thinking level.
 pub const KEY_REVIEW_THINKING_LEVEL: &str = "review_thinking_level";
+/// Settings key for Claude permission mode.
 pub const KEY_CLAUDE_PERMISSION_MODE: &str = "claude_permission_mode";
+/// Settings key for raw environment variables text.
 pub const KEY_ENV_VARS: &str = "env_vars";
+/// Settings key for optional workspaces root override.
 pub const KEY_WORKSPACES_ROOT: &str = "workspaces_root";
 
 const DEFAULT_SETTINGS: &[(&str, &str)] = &[
@@ -18,12 +24,16 @@ const DEFAULT_SETTINGS: &[(&str, &str)] = &[
   (KEY_WORKSPACES_ROOT, ""),
 ];
 
+/// Stored settings entry.
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct SettingEntry {
+  /// Setting key.
   pub key: String,
+  /// Setting value.
   pub value: String,
 }
 
+/// Ensure the default settings are present on first run.
 pub async fn ensure_defaults(pool: &SqlitePool) -> Result<(), DbError> {
   for (key, value) in DEFAULT_SETTINGS {
     sqlx::query(
@@ -38,6 +48,7 @@ pub async fn ensure_defaults(pool: &SqlitePool) -> Result<(), DbError> {
   Ok(())
 }
 
+/// List all settings entries ordered by key.
 pub async fn list_settings(pool: &SqlitePool) -> Result<Vec<SettingEntry>, DbError> {
   let rows = sqlx::query_as::<_, SettingEntry>("SELECT key, value FROM settings ORDER BY key")
     .fetch_all(pool)
@@ -45,6 +56,7 @@ pub async fn list_settings(pool: &SqlitePool) -> Result<Vec<SettingEntry>, DbErr
   Ok(rows)
 }
 
+/// Insert or update a settings value by key.
 pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> Result<(), DbError> {
   sqlx::query(
     "INSERT INTO settings (key, value) VALUES (?, ?)
@@ -57,6 +69,7 @@ pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> Result<()
   Ok(())
 }
 
+/// Fetch a settings value by key.
 pub async fn get_setting(pool: &SqlitePool, key: &str) -> Result<Option<String>, DbError> {
   let value = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
     .bind(key)
@@ -65,10 +78,12 @@ pub async fn get_setting(pool: &SqlitePool, key: &str) -> Result<Option<String>,
   Ok(value)
 }
 
+/// Get the raw env var block stored in settings.
 pub async fn get_env_vars(pool: &SqlitePool) -> Result<String, DbError> {
   Ok(get_setting(pool, KEY_ENV_VARS).await?.unwrap_or_default())
 }
 
+/// Persist the raw env var block in settings.
 pub async fn set_env_vars(pool: &SqlitePool, value: &str) -> Result<(), DbError> {
   set_setting(pool, KEY_ENV_VARS, value).await
 }

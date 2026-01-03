@@ -5,15 +5,20 @@ use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
+/// SQLite connection wrapper for the Supertree app.
 #[derive(Debug, Clone)]
 pub struct Database {
   pool: SqlitePool,
 }
 
+/// Errors returned by database initialization and queries.
 #[derive(Debug)]
 pub enum DbError {
+  /// Error produced by sqlx during connection or query execution.
   Sqlx(sqlx::Error),
+  /// Error produced by sqlx migrations.
   Migrate(sqlx::migrate::MigrateError),
+  /// The database path was invalid or missing.
   InvalidPath(String),
 }
 
@@ -42,6 +47,7 @@ impl From<sqlx::migrate::MigrateError> for DbError {
 }
 
 impl Database {
+  /// Connect to the SQLite database using the resolved app paths.
   pub async fn connect(paths: &AppPaths) -> Result<Self, DbError> {
     let db_path = ensure_db_parent(&paths.db_path)?;
     let options = SqliteConnectOptions::new()
@@ -60,6 +66,7 @@ impl Database {
     Ok(Self { pool })
   }
 
+  /// Access the underlying sqlx connection pool.
   pub fn pool(&self) -> &SqlitePool {
     &self.pool
   }

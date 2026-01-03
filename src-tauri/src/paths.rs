@@ -4,19 +4,28 @@ use std::path::PathBuf;
 use tauri::AppHandle;
 use tauri::Manager;
 
+/// Resolved filesystem locations used by the Supertree app.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppPaths {
+  /// Root application data directory for Supertree.
   pub app_data_dir: PathBuf,
+  /// Directory where runtime logs are stored.
   pub logs_dir: PathBuf,
+  /// Directory that holds workspace checkouts/worktrees.
   pub workspaces_dir: PathBuf,
+  /// Directory for bundled or downloaded tools.
   pub tools_dir: PathBuf,
+  /// Path to the SQLite database file.
   pub db_path: PathBuf,
 }
 
+/// Errors that can occur while resolving or creating app paths.
 #[derive(Debug)]
 pub enum PathError {
+  /// A path could not be resolved by Tauri.
   Resolve(String),
+  /// An IO operation failed while creating directories.
   Io(std::io::Error),
 }
 
@@ -37,6 +46,7 @@ impl From<std::io::Error> for PathError {
   }
 }
 
+/// Resolve app data directories and database path for the current runtime.
 pub fn resolve_paths(app: &AppHandle) -> Result<AppPaths, PathError> {
   let app_data_dir = app
     .path()
@@ -56,6 +66,7 @@ pub fn resolve_paths(app: &AppHandle) -> Result<AppPaths, PathError> {
   })
 }
 
+/// Create the on-disk directories required by the app if missing.
 pub fn ensure_dirs(paths: &AppPaths) -> Result<(), PathError> {
   std::fs::create_dir_all(&paths.app_data_dir)?;
   std::fs::create_dir_all(&paths.logs_dir)?;
