@@ -1,5 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod db;
+mod paths;
+mod settings;
+
+use serde::Serialize;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -7,9 +12,65 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tauri::Manager;
 
+use crate::db::Database;
+use crate::paths::{AppPaths, ensure_dirs, resolve_paths};
+use crate::settings::SettingEntry;
+
 #[tauri::command]
 fn hello(name: String) -> String {
   format!("Hello, {}!", name)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppInfo {
+  version: String,
+  paths: AppPaths,
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+fn getAppInfo(app: tauri::AppHandle, paths: tauri::State<'_, AppPaths>) -> AppInfo {
+  AppInfo {
+    version: app.package_info().version.to_string(),
+    paths: paths.inner().clone(),
+  }
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn listSettings(db: tauri::State<'_, Database>) -> Result<Vec<SettingEntry>, String> {
+  settings::list_settings(db.pool())
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn setSetting(
+  db: tauri::State<'_, Database>,
+  key: String,
+  value: String,
+) -> Result<(), String> {
+  settings::set_setting(db.pool(), &key, &value)
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn getEnvVars(db: tauri::State<'_, Database>) -> Result<String, String> {
+  settings::get_env_vars(db.pool())
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn setEnvVars(db: tauri::State<'_, Database>, value: String) -> Result<(), String> {
+  settings::set_env_vars(db.pool(), &value)
+    .await
+    .map_err(|err| err.to_string())
 }
 
 struct SidecarProcess {
@@ -93,6 +154,14 @@ fn sidecar_entry() -> Result<PathBuf, String> {
 fn main() {
   tauri::Builder::default()
     .setup(|app| {
+      let paths = resolve_paths(app.handle()).map_err(|err| err.to_string())?;
+      ensure_dirs(&paths).map_err(|err| err.to_string())?;
+      let db = tauri::async_runtime::block_on(Database::connect(&paths))
+        .map_err(|err| err.to_string())?;
+      tauri::async_runtime::block_on(settings::ensure_defaults(db.pool()))
+        .map_err(|err| err.to_string())?;
+      app.manage(paths);
+      app.manage(db);
       if cfg!(debug_assertions) {
         match SidecarProcess::spawn() {
           Ok(process) => {
@@ -105,7 +174,14 @@ fn main() {
       }
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![hello])
+    .invoke_handler(tauri::generate_handler![
+      hello,
+      getAppInfo,
+      listSettings,
+      setSetting,
+      getEnvVars,
+      setEnvVars
+    ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
