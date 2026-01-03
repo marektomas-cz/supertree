@@ -5,18 +5,22 @@ mod git;
 mod paths;
 mod repos;
 mod settings;
+mod workspace;
 
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::Manager;
 
-use crate::db::Database;
-use crate::git::{clone_repo, inspect_repo, is_git_repo, read_supertree_config, repo_name_from_url};
+use crate::db::{Database, DbError};
+use crate::git::{
+  branch_exists, clone_repo, create_worktree, inspect_repo, is_git_repo, read_supertree_config,
+  remove_worktree, repo_name_from_url, set_sparse_checkout,
+};
 use crate::paths::{ensure_dirs, resolve_paths, AppPaths};
 use crate::repos::{NewRepo, RepoRecord};
 use crate::settings::SettingEntry;
@@ -38,6 +42,13 @@ struct AppInfo {
 enum AddRepoRequest {
   Local { path: String },
   Clone { url: String, destination: Option<String> },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum CreateWorkspaceRequest {
+  Default { repo_id: String },
+  Branch { repo_id: String, branch: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +221,267 @@ async fn removeRepo(
 
 #[allow(non_snake_case)]
 #[tauri::command]
+async fn listWorkspaces(
+  db: tauri::State<'_, Database>,
+) -> Result<Vec<workspace::WorkspaceRecord>, String> {
+  workspace::list_workspaces(db.pool())
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn createWorkspace(
+  db: tauri::State<'_, Database>,
+  paths: tauri::State<'_, AppPaths>,
+  payload: CreateWorkspaceRequest,
+) -> Result<workspace::WorkspaceRecord, String> {
+  let (repo_id, branch_override) = match payload {
+    CreateWorkspaceRequest::Default { repo_id } => (repo_id, None),
+    CreateWorkspaceRequest::Branch { repo_id, branch } => (repo_id, Some(branch)),
+  };
+
+  let repo = repos::get_repo_by_id(db.pool(), &repo_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let branch = branch_override.unwrap_or_else(|| repo.default_branch.clone());
+  let branch = branch.trim().to_string();
+  if branch.is_empty() {
+    return Err("Branch name is required".to_string());
+  }
+
+  let repo_root = PathBuf::from(&repo.root_path);
+  let exists = branch_exists(&repo_root, &branch).map_err(|err| err.to_string())?;
+  if !exists {
+    return Err(format!("Branch does not exist: {branch}"));
+  }
+
+  if let Some(existing_id) =
+    workspace::find_active_workspace_for_branch(db.pool(), &repo_id, &branch)
+      .await
+      .map_err(|err| err.to_string())?
+  {
+    return Err(format!(
+      "Workspace already exists for branch {branch} (id: {existing_id})"
+    ));
+  }
+
+  let id = workspace::generate_id(db.pool())
+    .await
+    .map_err(|err| err.to_string())?;
+  let directory_name = workspace::build_directory_name(&repo.name, &branch, &id);
+  let workspace_path = paths.workspaces_dir.join(&directory_name);
+  if workspace_path.exists() {
+    return Err(format!(
+      "Workspace path already exists: {}",
+      workspace_path.display()
+    ));
+  }
+
+  let base_port = workspace::allocate_base_port(db.pool())
+    .await
+    .map_err(|err| err.to_string())?;
+
+  create_worktree(&repo_root, &workspace_path, &branch).map_err(|err| err.to_string())?;
+
+  if let Err(err) = ensure_context_dirs(&workspace_path) {
+    let _ = remove_worktree(&repo_root, &workspace_path);
+    let _ = fs::remove_dir_all(&workspace_path);
+    return Err(err);
+  }
+
+  let new_workspace = workspace::NewWorkspace {
+    id: id.clone(),
+    repo_id: repo_id.clone(),
+    branch: branch.clone(),
+    directory_name: Some(directory_name),
+    path: workspace_path.to_string_lossy().to_string(),
+    state: workspace::active_state().to_string(),
+    base_port: Some(base_port),
+  };
+
+  match workspace::insert_workspace(db.pool(), new_workspace).await {
+    Ok(record) => Ok(record),
+    Err(err) => {
+      let _ = remove_worktree(&repo_root, &workspace_path);
+      let _ = fs::remove_dir_all(&workspace_path);
+      let message = match err {
+        DbError::Conflict(details) => details,
+        other => other.to_string(),
+      };
+      Err(message)
+    }
+  }
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn archiveWorkspace(
+  db: tauri::State<'_, Database>,
+  paths: tauri::State<'_, AppPaths>,
+  workspace_id: String,
+  allow_script: bool,
+) -> Result<(), String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  if workspace_record.state == workspace::archived_state() {
+    return Ok(());
+  }
+
+  let repo = repos::get_repo_by_id(db.pool(), &workspace_record.repo_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let workspace_path = PathBuf::from(&workspace_record.path);
+  let workspace_root = paths
+    .workspaces_dir
+    .canonicalize()
+    .map_err(|err| format!("Cannot resolve workspaces root: {err}"))?;
+  let resolved_workspace = match workspace_path.canonicalize() {
+    Ok(path) => path,
+    Err(_err) if !workspace_path.exists() => workspace_path.clone(),
+    Err(err) => return Err(format!("Cannot resolve workspace path: {err}")),
+  };
+  if !resolved_workspace.starts_with(&workspace_root) {
+    return Err(format!(
+      "Refusing to delete workspace outside managed directory: {}",
+      resolved_workspace.display()
+    ));
+  }
+  if let Some(script) = repo
+    .scripts_archive
+    .as_ref()
+    .filter(|value| !value.trim().is_empty())
+  {
+    if !allow_script {
+      return Err("Archive script requires confirmation.".to_string());
+    }
+    run_workspace_script(script, &workspace_path, workspace_record.base_port)?;
+  }
+
+  if workspace_path.exists() {
+    remove_worktree(&PathBuf::from(&repo.root_path), &workspace_path)
+      .map_err(|err| err.to_string())?;
+  }
+  if let Err(err) = fs::remove_dir_all(&workspace_path) {
+    if err.kind() != std::io::ErrorKind::NotFound {
+      return Err(err.to_string());
+    }
+  }
+
+  workspace::set_workspace_state(db.pool(), &workspace_id, workspace::archived_state())
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn unarchiveWorkspace(
+  db: tauri::State<'_, Database>,
+  paths: tauri::State<'_, AppPaths>,
+  workspace_id: String,
+) -> Result<(), String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  if workspace_record.state == workspace::active_state() {
+    return Err("Workspace is already active".to_string());
+  }
+
+  if let Some(existing_id) = workspace::find_active_workspace_for_branch(
+    db.pool(),
+    &workspace_record.repo_id,
+    &workspace_record.branch,
+  )
+  .await
+  .map_err(|err| err.to_string())?
+  {
+    return Err(format!(
+      "Workspace already exists for branch {} (id: {})",
+      workspace_record.branch, existing_id
+    ));
+  }
+
+  let repo = repos::get_repo_by_id(db.pool(), &workspace_record.repo_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo_root = PathBuf::from(&repo.root_path);
+  let exists = branch_exists(&repo_root, &workspace_record.branch)
+    .map_err(|err| err.to_string())?;
+  if !exists {
+    return Err(format!(
+      "Branch does not exist: {}",
+      workspace_record.branch
+    ));
+  }
+  let workspace_path = PathBuf::from(&workspace_record.path);
+  if workspace_path.exists() {
+    return Err(format!(
+      "Workspace path already exists: {}",
+      workspace_path.display()
+    ));
+  }
+
+  if !workspace_path.starts_with(&paths.workspaces_dir) {
+    return Err(format!(
+      "Refusing to create workspace outside managed directory: {}",
+      workspace_path.display()
+    ));
+  }
+
+  create_worktree(&repo_root, &workspace_path, &workspace_record.branch)
+    .map_err(|err| err.to_string())?;
+  if let Err(err) = ensure_context_dirs(&workspace_path) {
+    let _ = remove_worktree(&repo_root, &workspace_path);
+    let _ = fs::remove_dir_all(&workspace_path);
+    return Err(err);
+  }
+
+  workspace::set_workspace_state(db.pool(), &workspace_id, workspace::active_state())
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn pinWorkspace(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+  pinned: bool,
+) -> Result<(), String> {
+  workspace::set_workspace_pinned(db.pool(), &workspace_id, pinned)
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn markWorkspaceUnread(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+  unread: bool,
+) -> Result<(), String> {
+  workspace::set_workspace_unread(db.pool(), &workspace_id, unread)
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn setWorkspaceSparseCheckout(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+  patterns: Vec<String>,
+) -> Result<(), String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  set_sparse_checkout(Path::new(&workspace_record.path), &patterns)
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
 fn openPathIn(path: String, target: OpenTarget) -> Result<(), String> {
   let path = PathBuf::from(path);
   if !path.exists() {
@@ -271,6 +543,53 @@ fn build_open_command(path: &PathBuf, target: &OpenTarget) -> Command {
     };
     let mut command = Command::new(program);
     command.arg(path);
+    return command;
+  }
+
+  #[allow(unreachable_code)]
+  Command::new("true")
+}
+
+fn ensure_context_dirs(workspace_path: &Path) -> Result<(), String> {
+  let context_dir = workspace_path.join(".context").join("attachments");
+  fs::create_dir_all(&context_dir).map_err(|err| err.to_string())
+}
+
+fn run_workspace_script(
+  script: &str,
+  workspace_path: &Path,
+  base_port: Option<i64>,
+) -> Result<(), String> {
+  let mut command = build_shell_command(script);
+  command.current_dir(workspace_path);
+  if let Some(port) = base_port {
+    let value = port.to_string();
+    command.env("SUPERTREE_PORT", &value);
+    command.env("supertree_PORT", &value);
+  }
+  let status = command.status().map_err(|err| err.to_string())?;
+  if !status.success() {
+    return Err(format!(
+      "Workspace script failed ({}): exit code {:?}",
+      script,
+      status.code()
+    ));
+  }
+  Ok(())
+}
+
+fn build_shell_command(script: &str) -> Command {
+  #[cfg(target_os = "windows")]
+  {
+    let mut command = Command::new("cmd");
+    command.arg("/C").arg(script);
+    return command;
+  }
+
+  #[cfg(not(target_os = "windows"))]
+  {
+    let mut command = Command::new("sh");
+    command.arg("-lc").arg(script);
     return command;
   }
 
@@ -389,6 +708,13 @@ fn main() {
       listRepos,
       addRepo,
       removeRepo,
+      listWorkspaces,
+      createWorkspace,
+      archiveWorkspace,
+      unarchiveWorkspace,
+      pinWorkspace,
+      markWorkspaceUnread,
+      setWorkspaceSparseCheckout,
       openPathIn
     ])
     .run(tauri::generate_context!())

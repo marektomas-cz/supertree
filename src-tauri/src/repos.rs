@@ -51,6 +51,20 @@ pub async fn list_repos(pool: &SqlitePool) -> Result<Vec<RepoRecord>, DbError> {
   Ok(rows)
 }
 
+/// Fetch a repository by id.
+pub async fn get_repo_by_id(pool: &SqlitePool, repo_id: &str) -> Result<RepoRecord, DbError> {
+  let row = sqlx::query_as::<_, RepoRecord>(
+    "SELECT id, name, root_path, remote_url, default_branch,
+            scripts_setup, scripts_run, scripts_archive, run_script_mode
+     FROM repos
+     WHERE id = ?",
+  )
+  .bind(repo_id)
+  .fetch_optional(pool)
+  .await?;
+  row.ok_or_else(|| DbError::NotFound(format!("Repository not found: {repo_id}")))
+}
+
 /// Insert a new repository record.
 pub async fn insert_repo(pool: &SqlitePool, new_repo: NewRepo) -> Result<RepoRecord, DbError> {
   let existing: Option<String> =

@@ -170,6 +170,87 @@ pub fn repo_name_from_url(url: &str) -> String {
   last_segment.trim_end_matches(".git").to_string()
 }
 
+/// List local branches for a repository.
+pub fn list_branches(path: &Path) -> Result<Vec<String>, GitError> {
+  let output = run_git(&[
+    "-C",
+    path.to_str().ok_or(GitError::InvalidUtf8)?,
+    "for-each-ref",
+    "--format=%(refname:short)",
+    "refs/heads",
+  ])?;
+  Ok(
+    output
+      .lines()
+      .map(|line| line.trim())
+      .filter(|line| !line.is_empty())
+      .map(|line| line.to_string())
+      .collect(),
+  )
+}
+
+/// Check if a branch exists locally.
+pub fn branch_exists(path: &Path, branch: &str) -> Result<bool, GitError> {
+  if branch.trim().is_empty() {
+    return Ok(false);
+  }
+  let branches = list_branches(path)?;
+  Ok(branches.iter().any(|name| name == branch))
+}
+
+/// Create a git worktree for the given branch.
+pub fn create_worktree(repo_path: &Path, workspace_path: &Path, branch: &str) -> Result<(), GitError> {
+  let repo_str = repo_path.to_str().ok_or(GitError::InvalidUtf8)?;
+  let workspace_str = workspace_path.to_str().ok_or(GitError::InvalidUtf8)?;
+  run_git(&[
+    "-C",
+    repo_str,
+    "worktree",
+    "add",
+    "--no-track",
+    workspace_str,
+    branch,
+  ])?;
+  Ok(())
+}
+
+/// Remove a git worktree.
+pub fn remove_worktree(repo_path: &Path, workspace_path: &Path) -> Result<(), GitError> {
+  let repo_str = repo_path.to_str().ok_or(GitError::InvalidUtf8)?;
+  let workspace_str = workspace_path.to_str().ok_or(GitError::InvalidUtf8)?;
+  run_git(&["-C", repo_str, "worktree", "remove", workspace_str])?;
+  Ok(())
+}
+
+/// Configure sparse checkout patterns for a worktree.
+pub fn set_sparse_checkout(worktree_path: &Path, patterns: &[String]) -> Result<(), GitError> {
+  let worktree_str = worktree_path.to_str().ok_or(GitError::InvalidUtf8)?;
+  if patterns.is_empty() {
+    run_git(&["-C", worktree_str, "sparse-checkout", "disable"])?;
+    return Ok(());
+  }
+  let mut args = vec![
+    "-C".to_string(),
+    worktree_str.to_string(),
+    "sparse-checkout".to_string(),
+    "set".to_string(),
+  ];
+  for pattern in patterns {
+    let trimmed = pattern.trim();
+    if !trimmed.is_empty() {
+      args.push(trimmed.to_string());
+    }
+  }
+  if args.len() == 4 {
+    return Err(GitError::MissingPath(
+      "Sparse checkout requires at least one pattern".to_string(),
+    ));
+  }
+  let arg_refs: Vec<&str> = args.iter().map(|value| value.as_str()).collect();
+  run_git(&arg_refs)?;
+  Ok(())
+}
+
 fn detect_remote_url(path: &Path) -> Result<Option<String>, GitError> {
   let remotes = run_git(&[
     "-C",
