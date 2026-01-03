@@ -1,0 +1,28 @@
+{
+  "$schema": "https://tauri.app/schema.json",
+  "productName": "Supertree",
+  "version": "0.0.0",
+  "identifier": "com.supertree.app",
+  "build": {
+    "beforeDevCommand": "node scripts/dev-tauri.mjs",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Supertree",
+        "width": 1280,
+        "height": 800
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  }
+}

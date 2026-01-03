@@ -1,0 +1,15 @@
+[package]
+name = "supertree"
+version = "0.0.0"
+description = "Supertree desktop application"
+authors = ["Supertree project"]
+edition = "2021"
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "2" }
+
+[dependencies]
+tauri = { version = "2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

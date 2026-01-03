@@ -1,0 +1,15 @@
+{
+  "name": "supertree-sidecar",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --outfile=dist/index.js",
+    "build:watch": "esbuild src/index.ts --bundle --platform=node --target=node20 --outfile=dist/index.js --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "esbuild": "^0.24.0",
+    "typescript": "5.5.4"
+  }
+}
