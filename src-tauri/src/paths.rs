@@ -38,7 +38,14 @@ impl fmt::Display for PathError {
   }
 }
 
-impl std::error::Error for PathError {}
+impl std::error::Error for PathError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    match self {
+      PathError::Resolve(_) => None,
+      PathError::Io(err) => Some(err),
+    }
+  }
+}
 
 impl From<std::io::Error> for PathError {
   fn from(err: std::io::Error) -> Self {

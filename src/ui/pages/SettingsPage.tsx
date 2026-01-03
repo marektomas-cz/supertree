@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
 
@@ -38,35 +38,49 @@ export default function SettingsPage() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [error, setError] = useState<string | null>(null);
+  const saveTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     let active = true;
-    invoke<string>('getEnvVars')
-      .then((value) => {
-        if (active) {
-          setEnvVars(value ?? '');
-        }
-      })
-      .catch((err) => {
-        if (active) {
-          setError(String(err));
-        }
-      });
+    const load = async () => {
+      const [envResult, infoResult] = await Promise.allSettled([
+        invoke<string>('getEnvVars'),
+        invoke<AppInfo>('getAppInfo'),
+      ]);
 
-    invoke<AppInfo>('getAppInfo')
-      .then((info) => {
-        if (active) {
-          setAppInfo(info);
-        }
-      })
-      .catch((err) => {
-        if (active) {
-          setError(String(err));
-        }
-      });
+      if (!active) {
+        return;
+      }
+
+      const errors: string[] = [];
+
+      if (envResult.status === 'fulfilled') {
+        setEnvVars(envResult.value ?? '');
+      } else {
+        errors.push(String(envResult.reason));
+      }
+
+      if (infoResult.status === 'fulfilled') {
+        setAppInfo(infoResult.value);
+      } else {
+        errors.push(String(infoResult.reason));
+      }
+
+      setError(errors.length > 0 ? errors.join(' | ') : null);
+    };
+
+    load();
 
     return () => {
       active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (saveTimeoutRef.current !== null) {
+        window.clearTimeout(saveTimeoutRef.current);
+      }
     };
   }, []);
 
@@ -89,7 +103,13 @@ export default function SettingsPage() {
     try {
       await invoke('setEnvVars', { value: envVars });
       setSaveState('saved');
-      window.setTimeout(() => setSaveState('idle'), 1500);
+      if (saveTimeoutRef.current !== null) {
+        window.clearTimeout(saveTimeoutRef.current);
+      }
+      saveTimeoutRef.current = window.setTimeout(() => {
+        setSaveState('idle');
+        saveTimeoutRef.current = null;
+      }, 1500);
     } catch (err) {
       setSaveState('error');
       setError(String(err));
@@ -107,12 +127,17 @@ export default function SettingsPage() {
             <button
               key={section}
               type="button"
-              onClick={() => setActiveSection(section)}
+              disabled={section !== 'Env'}
+              onClick={() => {
+                if (section === 'Env') {
+                  setActiveSection(section);
+                }
+              }}
               className={`rounded-md px-3 py-2 text-left text-sm transition ${
                 activeSection === section
                   ? 'bg-slate-800 text-slate-100'
                   : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
-              }`}
+              } ${section !== 'Env' ? 'cursor-not-allowed text-slate-600 hover:bg-transparent hover:text-slate-600' : ''}`}
             >
               {section}
             </button>

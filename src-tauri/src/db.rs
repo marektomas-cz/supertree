@@ -32,7 +32,15 @@ impl fmt::Display for DbError {
   }
 }
 
-impl std::error::Error for DbError {}
+impl std::error::Error for DbError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    match self {
+      DbError::Sqlx(err) => Some(err),
+      DbError::Migrate(err) => Some(err),
+      DbError::InvalidPath(_) => None,
+    }
+  }
+}
 
 impl From<sqlx::Error> for DbError {
   fn from(err: sqlx::Error) -> Self {
@@ -55,12 +63,10 @@ impl Database {
       .create_if_missing(true)
       .journal_mode(SqliteJournalMode::Wal)
       .synchronous(SqliteSynchronous::Normal)
+      .foreign_keys(true)
       .busy_timeout(Duration::from_secs(30));
 
     let pool = SqlitePool::connect_with(options).await?;
-    sqlx::query("PRAGMA foreign_keys = ON;")
-      .execute(&pool)
-      .await?;
     sqlx::migrate!().run(&pool).await?;
 
     Ok(Self { pool })

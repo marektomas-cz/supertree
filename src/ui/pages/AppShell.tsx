@@ -15,6 +15,7 @@ export default function AppShell() {
   useEffect(() => {
     let active = true;
     if (activeView === 'workspace') {
+      setError(null);
       invoke<string>('hello', { name: 'Supertree' })
         .then((message) => {
           if (active) {
