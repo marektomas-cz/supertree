@@ -431,7 +431,11 @@ async fn unarchiveWorkspace(
 
   create_worktree(&repo_root, &workspace_path, &workspace_record.branch)
     .map_err(|err| err.to_string())?;
-  ensure_context_dirs(&workspace_path)?;
+  if let Err(err) = ensure_context_dirs(&workspace_path) {
+    let _ = remove_worktree(&repo_root, &workspace_path);
+    let _ = fs::remove_dir_all(&workspace_path);
+    return Err(err);
+  }
 
   workspace::set_workspace_state(db.pool(), &workspace_id, workspace::active_state())
     .await
