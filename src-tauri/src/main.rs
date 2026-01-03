@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tauri::Manager;
 
-use crate::db::Database;
+use crate::db::{Database, DbError};
 use crate::git::{
   branch_exists, clone_repo, create_worktree, inspect_repo, is_git_repo, read_supertree_config,
   remove_worktree, repo_name_from_url, set_sparse_checkout,
@@ -305,7 +305,11 @@ async fn createWorkspace(
     Err(err) => {
       let _ = remove_worktree(&repo_root, &workspace_path);
       let _ = fs::remove_dir_all(&workspace_path);
-      Err(err.to_string())
+      let message = match err {
+        DbError::Conflict(details) => details,
+        other => other.to_string(),
+      };
+      Err(message)
     }
   }
 }
