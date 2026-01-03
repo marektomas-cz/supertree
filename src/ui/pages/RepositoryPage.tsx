@@ -1,19 +1,6 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
-
-type RepoInfo = {
-  id: string;
-  name: string;
-  rootPath: string;
-  remoteUrl?: string | null;
-  defaultBranch: string;
-  scriptsSetup?: string | null;
-  scriptsRun?: string | null;
-  scriptsArchive?: string | null;
-  runScriptMode?: string | null;
-};
-
-type OpenTarget = 'system' | 'vscode' | 'cursor' | 'zed';
+import type { OpenTarget, RepoInfo } from '@/types/repo';
 
 type RepositoryPageProps = {
   repo: RepoInfo;
@@ -23,6 +10,7 @@ type RepositoryPageProps = {
 
 export default function RepositoryPage({ repo, onOpen, onRemove }: RepositoryPageProps) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   const fileManagerLabel = useMemo(() => {
     const agent = navigator.userAgent;
@@ -41,6 +29,32 @@ export default function RepositoryPage({ repo, onOpen, onRemove }: RepositoryPag
     { id: 'cursor', label: 'Cursor' },
     { id: 'zed', label: 'Zed' },
   ];
+
+  useEffect(() => {
+    if (!menuOpen) {
+      return;
+    }
+
+    const handleClickOutside = (event: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setMenuOpen(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [menuOpen]);
 
   const scriptRows = [
     { label: 'Setup', value: repo.scriptsSetup },
@@ -65,7 +79,7 @@ export default function RepositoryPage({ repo, onOpen, onRemove }: RepositoryPag
           <div className="text-xs uppercase tracking-[0.3em] text-slate-500">Repository</div>
           <h1 className="mt-2 text-2xl font-semibold">{repo.name}</h1>
         </div>
-        <div className="relative">
+        <div className="relative" ref={menuRef}>
           <Button onClick={() => setMenuOpen((prev) => !prev)}>Open</Button>
           {menuOpen ? (
             <div className="absolute right-0 mt-2 w-48 rounded-md border border-slate-800 bg-slate-950 p-2 shadow-xl">

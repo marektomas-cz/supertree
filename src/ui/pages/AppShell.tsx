@@ -2,22 +2,9 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
 import { formatGreeting } from '@/lib/format';
+import type { OpenTarget, RepoInfo } from '@/types/repo';
 import RepositoryPage from './RepositoryPage';
 import SettingsPage from './SettingsPage';
-
-type RepoInfo = {
-  id: string;
-  name: string;
-  rootPath: string;
-  remoteUrl?: string | null;
-  defaultBranch: string;
-  scriptsSetup?: string | null;
-  scriptsRun?: string | null;
-  scriptsArchive?: string | null;
-  runScriptMode?: string | null;
-};
-
-type OpenTarget = 'system' | 'vscode' | 'cursor' | 'zed';
 
 /**
  * Top-level shell layout with left navigation and main content area.
@@ -114,7 +101,6 @@ export default function AppShell() {
           : { kind: 'clone', url: cloneUrl, destination: cloneDestination || undefined };
       const repo = await invoke<RepoInfo>('addRepo', payload);
       await loadRepos(repo.id);
-      setSelectedRepoId(repo.id);
       setActiveView('repo');
       setAddRepoOpen(false);
       setLocalPath('');
@@ -367,10 +353,11 @@ export default function AppShell() {
 
             {addRepoMode === 'local' ? (
               <div className="mt-4">
-                <label className="text-xs uppercase tracking-widest text-slate-500">
+                <label htmlFor="local-path" className="text-xs uppercase tracking-widest text-slate-500">
                   Local path
                 </label>
                 <input
+                  id="local-path"
                   value={localPath}
                   onChange={(event) => setLocalPath(event.target.value)}
                   placeholder="C:\\projects\\my-repo"
@@ -380,10 +367,11 @@ export default function AppShell() {
             ) : (
               <div className="mt-4 space-y-4">
                 <div>
-                  <label className="text-xs uppercase tracking-widest text-slate-500">
+                  <label htmlFor="clone-url" className="text-xs uppercase tracking-widest text-slate-500">
                     Git URL
                   </label>
                   <input
+                    id="clone-url"
                     value={cloneUrl}
                     onChange={(event) => setCloneUrl(event.target.value)}
                     placeholder="https://github.com/org/repo.git"
@@ -391,10 +379,14 @@ export default function AppShell() {
                   />
                 </div>
                 <div>
-                  <label className="text-xs uppercase tracking-widest text-slate-500">
+                  <label
+                    htmlFor="clone-destination"
+                    className="text-xs uppercase tracking-widest text-slate-500"
+                  >
                     Destination (optional)
                   </label>
                   <input
+                    id="clone-destination"
                     value={cloneDestination}
                     onChange={(event) => setCloneDestination(event.target.value)}
                     placeholder="C:\\repos\\clone-target"

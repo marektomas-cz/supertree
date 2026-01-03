@@ -110,16 +110,21 @@ pub fn clone_repo(url: &str, target_dir: &Path) -> Result<(), GitError> {
   if url.trim().is_empty() {
     return Err(GitError::MissingPath("Git URL is required".to_string()));
   }
-  let status = Command::new("git")
+  let output = Command::new("git")
     .arg("clone")
     .arg(url)
     .arg(target_dir)
-    .status()
+    .output()
     .map_err(GitError::Io)?;
-  if !status.success() {
+  if !output.status.success() {
+    let stderr = String::from_utf8_lossy(&output.stderr);
     return Err(GitError::CommandFailed {
       command: "git clone".to_string(),
-      message: format!("exit code {:?}", status.code()),
+      message: if stderr.trim().is_empty() {
+        format!("exit code {:?}", output.status.code())
+      } else {
+        stderr.trim().to_string()
+      },
     });
   }
   Ok(())

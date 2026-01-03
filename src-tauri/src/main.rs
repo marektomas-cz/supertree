@@ -174,15 +174,23 @@ async fn removeRepo(
   let workspace_root = paths
     .workspaces_dir
     .canonicalize()
-    .unwrap_or_else(|_| paths.workspaces_dir.clone());
+    .map_err(|err| format!("Cannot resolve workspaces root: {err}"))?;
   let workspace_paths = repos::list_workspace_paths(db.pool(), &repo_id)
     .await
     .map_err(|err| err.to_string())?;
   for workspace_path in workspace_paths {
     let candidate = PathBuf::from(&workspace_path);
-    let resolved = candidate
-      .canonicalize()
-      .unwrap_or_else(|_| candidate.clone());
+    let resolved = match candidate.canonicalize() {
+      Ok(path) => path,
+      Err(_) if !candidate.exists() => continue,
+      Err(err) => {
+        return Err(format!(
+          "Cannot resolve workspace path {}: {}",
+          candidate.display(),
+          err
+        ));
+      }
+    };
     if !resolved.starts_with(&workspace_root) {
       return Err(format!(
         "Refusing to delete workspace outside managed directory: {}",
@@ -206,76 +214,7 @@ fn openPathIn(path: String, target: OpenTarget) -> Result<(), String> {
     return Err(format!("Path does not exist: {}", path.display()));
   }
 
-  let mut command = if cfg!(target_os = "windows") {
-    match target {
-      OpenTarget::System => {
-        let mut cmd = Command::new("explorer");
-        cmd.arg(&path);
-        cmd
-      }
-      OpenTarget::Vscode => {
-        let mut cmd = Command::new("code");
-        cmd.arg(&path);
-        cmd
-      }
-      OpenTarget::Cursor => {
-        let mut cmd = Command::new("cursor");
-        cmd.arg(&path);
-        cmd
-      }
-      OpenTarget::Zed => {
-        let mut cmd = Command::new("zed");
-        cmd.arg(&path);
-        cmd
-      }
-    }
-  } else if cfg!(target_os = "macos") {
-    match target {
-      OpenTarget::System => {
-        let mut cmd = Command::new("open");
-        cmd.arg(&path);
-        cmd
-      }
-      OpenTarget::Vscode => {
-        let mut cmd = Command::new("open");
-        cmd.arg("-a").arg("Visual Studio Code").arg(&path);
-        cmd
-      }
-      OpenTarget::Cursor => {
-        let mut cmd = Command::new("open");
-        cmd.arg("-a").arg("Cursor").arg(&path);
-        cmd
-      }
-      OpenTarget::Zed => {
-        let mut cmd = Command::new("open");
-        cmd.arg("-a").arg("Zed").arg(&path);
-        cmd
-      }
-    }
-  } else {
-    match target {
-      OpenTarget::System => {
-        let mut cmd = Command::new("xdg-open");
-        cmd.arg(&path);
-        cmd
-      }
-      OpenTarget::Vscode => {
-        let mut cmd = Command::new("code");
-        cmd.arg(&path);
-        cmd
-      }
-      OpenTarget::Cursor => {
-        let mut cmd = Command::new("cursor");
-        cmd.arg(&path);
-        cmd
-      }
-      OpenTarget::Zed => {
-        let mut cmd = Command::new("zed");
-        cmd.arg(&path);
-        cmd
-      }
-    }
-  };
+  let mut command = build_open_command(&path, &target);
 
   let status = command.status().map_err(|err| err.to_string())?;
   if !status.success() {
@@ -285,6 +224,57 @@ fn openPathIn(path: String, target: OpenTarget) -> Result<(), String> {
     ));
   }
   Ok(())
+}
+
+fn build_open_command(path: &PathBuf, target: &OpenTarget) -> Command {
+  #[cfg(target_os = "windows")]
+  {
+    let program = match target {
+      OpenTarget::System => "explorer",
+      OpenTarget::Vscode => "code",
+      OpenTarget::Cursor => "cursor",
+      OpenTarget::Zed => "zed",
+    };
+    let mut command = Command::new(program);
+    command.arg(path);
+    return command;
+  }
+
+  #[cfg(target_os = "macos")]
+  {
+    let mut command = Command::new("open");
+    match target {
+      OpenTarget::System => {
+        command.arg(path);
+      }
+      OpenTarget::Vscode => {
+        command.arg("-a").arg("Visual Studio Code").arg(path);
+      }
+      OpenTarget::Cursor => {
+        command.arg("-a").arg("Cursor").arg(path);
+      }
+      OpenTarget::Zed => {
+        command.arg("-a").arg("Zed").arg(path);
+      }
+    }
+    return command;
+  }
+
+  #[cfg(target_os = "linux")]
+  {
+    let program = match target {
+      OpenTarget::System => "xdg-open",
+      OpenTarget::Vscode => "code",
+      OpenTarget::Cursor => "cursor",
+      OpenTarget::Zed => "zed",
+    };
+    let mut command = Command::new(program);
+    command.arg(path);
+    return command;
+  }
+
+  #[allow(unreachable_code)]
+  Command::new("true")
 }
 
 struct SidecarProcess {
