@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
 import { formatGreeting } from '@/lib/format';
@@ -24,6 +24,7 @@ export default function AppShell() {
   const [cloneDestination, setCloneDestination] = useState('');
   const [addState, setAddState] = useState<'idle' | 'adding' | 'error'>('idle');
   const [addError, setAddError] = useState<string | null>(null);
+  const addRepoRef = useRef<HTMLDivElement>(null);
 
   const selectedRepo = useMemo(
     () => repos.find((repo) => repo.id === selectedRepoId) ?? null,
@@ -44,17 +45,24 @@ export default function AppShell() {
 
   const loadRepos = useCallback(async (nextSelectedId?: string) => {
     setRepoError(null);
-    const data = await invoke<RepoInfo[]>('listRepos');
-    setRepos(data);
-    setSelectedRepoId((prev) => {
-      if (nextSelectedId) {
-        return nextSelectedId;
-      }
-      if (prev && data.some((repo) => repo.id === prev)) {
-        return prev;
-      }
-      return null;
-    });
+    try {
+      const data = await invoke<RepoInfo[]>('listRepos');
+      setRepos(data);
+      setSelectedRepoId((prev) => {
+        if (nextSelectedId) {
+          return nextSelectedId;
+        }
+        if (prev && data.some((repo) => repo.id === prev)) {
+          return prev;
+        }
+        return null;
+      });
+    } catch (err) {
+      setRepoError(String(err));
+      setRepos([]);
+      setSelectedRepoId(null);
+      throw err;
+    }
   }, []);
 
   useEffect(() => {
@@ -147,6 +155,57 @@ export default function AppShell() {
     (addRepoMode === 'local'
       ? localPath.trim().length > 0
       : cloneUrl.trim().length > 0);
+
+  useEffect(() => {
+    if (!addRepoOpen) {
+      return;
+    }
+    const modal = addRepoRef.current;
+    if (!modal) {
+      return;
+    }
+
+    const getFocusable = () =>
+      Array.from(
+        modal.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hasAttribute('disabled'));
+
+    const focusables = getFocusable();
+    if (focusables.length > 0) {
+      focusables[0].focus();
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeAddRepo();
+        return;
+      }
+      if (event.key !== 'Tab') {
+        return;
+      }
+      const items = getFocusable();
+      if (items.length === 0) {
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [addRepoOpen, closeAddRepo]);
 
   return (
     <>
@@ -311,11 +370,19 @@ export default function AppShell() {
 
       {addRepoOpen ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-6">
-          <div className="w-full max-w-lg rounded-lg border border-slate-800 bg-slate-950 p-6 shadow-2xl">
+          <div
+            ref={addRepoRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="add-repo-title"
+            className="w-full max-w-lg rounded-lg border border-slate-800 bg-slate-950 p-6 shadow-2xl"
+          >
             <div className="flex items-start justify-between gap-4">
               <div>
                 <div className="text-xs uppercase tracking-[0.3em] text-slate-500">Repository</div>
-                <h2 className="mt-2 text-xl font-semibold">Add repository</h2>
+                <h2 id="add-repo-title" className="mt-2 text-xl font-semibold">
+                  Add repository
+                </h2>
               </div>
               <button
                 type="button"

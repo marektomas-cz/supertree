@@ -194,13 +194,33 @@ fn detect_default_branch(path: &Path) -> String {
     Some(value) => value,
     None => return "main".to_string(),
   };
-  let origin_head = run_git(&["-C", path_str, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-    .ok()
-    .and_then(|value| value.strip_prefix("origin/").map(|value| value.to_string()));
+  let origin_head = match run_git(&[
+    "-C",
+    path_str,
+    "symbolic-ref",
+    "--short",
+    "refs/remotes/origin/HEAD",
+  ]) {
+    Ok(value) => value.strip_prefix("origin/").map(|value| value.to_string()),
+    Err(err) => {
+      eprintln!(
+        "Failed to resolve origin/HEAD for {}: {}",
+        path.display(),
+        err
+      );
+      None
+    }
+  };
   if let Some(branch) = origin_head {
     return branch;
   }
-  run_git(&["-C", path_str, "symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|_| "main".to_string())
+  match run_git(&["-C", path_str, "symbolic-ref", "--short", "HEAD"]) {
+    Ok(branch) => branch,
+    Err(err) => {
+      eprintln!("Failed to resolve HEAD for {}: {}", path.display(), err);
+      "main".to_string()
+    }
+  }
 }
 
 fn run_git(args: &[&str]) -> Result<String, GitError> {

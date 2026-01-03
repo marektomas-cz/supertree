@@ -197,8 +197,10 @@ async fn removeRepo(
         resolved.display()
       ));
     }
-    if resolved.exists() {
-      fs::remove_dir_all(&resolved).map_err(|err| err.to_string())?;
+    if let Err(err) = fs::remove_dir_all(&resolved) {
+      if err.kind() != std::io::ErrorKind::NotFound {
+        return Err(err.to_string());
+      }
     }
   }
   repos::delete_repo(db.pool(), &repo_id)
@@ -216,13 +218,12 @@ fn openPathIn(path: String, target: OpenTarget) -> Result<(), String> {
 
   let mut command = build_open_command(&path, &target);
 
-  let status = command.status().map_err(|err| err.to_string())?;
-  if !status.success() {
-    return Err(format!(
-      "Open command failed with exit code {:?}",
-      status.code()
-    ));
-  }
+  command
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .map_err(|err| err.to_string())?;
   Ok(())
 }
 
