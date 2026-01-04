@@ -313,7 +313,9 @@ impl SidecarManager {
 
   async fn spawn_session(&self, session_id: &str) -> Result<Arc<SidecarSession>, String> {
     // NOTE: One Node sidecar process + socket reader per session for isolation.
-    // Resource usage (processes/FDs) scales linearly; keep session counts bounded.
+    // Per session: one child process, one socket connection, and stdio FDs (~4-6 total).
+    // Memory is dominated by the Node runtime + SDK (rough order: tens of MB per session).
+    // No pooling/limit yet; keep session counts bounded (TODO: pool/max sessions if needed).
     let (child, socket_path) = spawn_sidecar_process()?;
     let (reader, writer) = connect_socket(&socket_path).await?;
     let session = Arc::new(SidecarSession {

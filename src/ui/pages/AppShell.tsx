@@ -3004,7 +3004,7 @@ export default function AppShell() {
 
             <div className="mt-4 space-y-4">
               {activeAskRequest.questions.map((question, index) => (
-                <div key={`${question.question}-${index}`}>
+                <div key={index}>
                   <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">
                     Question {index + 1} of {activeAskRequest.questions.length}
                   </div>
