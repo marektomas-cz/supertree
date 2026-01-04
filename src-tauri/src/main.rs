@@ -13,7 +13,7 @@ mod workspace;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -34,8 +34,8 @@ use crate::db::{Database, DbError};
 use crate::attachments::AttachmentRecord;
 use crate::git::{
   branch_exists, clone_repo, create_worktree, diff as git_diff, inspect_repo, is_git_repo,
-  list_status, read_supertree_config, remove_worktree, repo_name_from_url, set_sparse_checkout,
-  GitStatusEntry,
+  list_branches, list_status, read_supertree_config, remove_worktree, repo_name_from_url,
+  set_sparse_checkout, GitStatusEntry,
 };
 use crate::paths::{ensure_dirs, resolve_paths, AppPaths};
 use crate::repos::{NewRepo, RepoRecord};
@@ -68,6 +68,62 @@ struct FilePreview {
 #[serde(rename_all = "camelCase")]
 struct WorkspaceDiffResponse {
   diff: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubAuthStatus {
+  available: bool,
+  authenticated: bool,
+  message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestInfo {
+  number: i64,
+  url: String,
+  base_branch: String,
+  head_branch: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestCheck {
+  name: String,
+  status: Option<String>,
+  conclusion: Option<String>,
+  details_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestCheckSummary {
+  total: usize,
+  failed: usize,
+  pending: usize,
+  success: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestStatus {
+  number: i64,
+  url: String,
+  base_branch: String,
+  head_branch: String,
+  review_decision: Option<String>,
+  mergeable: Option<String>,
+  state: Option<String>,
+  checks: PullRequestCheckSummary,
+  failing_checks: Vec<PullRequestCheck>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestCommentsResult {
+  content: String,
+  new_comments: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -457,6 +513,10 @@ async fn createWorkspace(
     base_port: Some(base_port),
     setup_log_path,
     archive_log_path: None,
+    intended_target_branch: Some(repo.default_branch.clone()),
+    pr_number: None,
+    pr_url: None,
+    pr_last_comment_id: None,
   };
 
   match workspace::insert_workspace(db.pool(), new_workspace).await {
@@ -1083,6 +1143,275 @@ async fn getWorkspaceDiff(
   .map_err(|err| err.to_string())
 }
 
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn getGithubAuthStatus() -> Result<GithubAuthStatus, String> {
+  tauri::async_runtime::spawn_blocking(detect_github_auth_status)
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn listRepoBranches(
+  db: tauri::State<'_, Database>,
+  repo_id: String,
+) -> Result<Vec<String>, String> {
+  let repo = repos::get_repo_by_id(db.pool(), &repo_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let root = PathBuf::from(&repo.root_path);
+  let default_branch = repo.default_branch.clone();
+  let mut branches = tauri::async_runtime::spawn_blocking(move || list_branches(&root))
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())?;
+  if !default_branch.trim().is_empty()
+    && !branches.iter().any(|branch| branch == &default_branch)
+  {
+    branches.push(default_branch);
+  }
+  branches.sort();
+  Ok(branches)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn setWorkspaceTargetBranch(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+  target_branch: Option<String>,
+) -> Result<(), String> {
+  let normalized = target_branch
+    .as_deref()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(|value| value.to_string());
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  if let Some(branch) = normalized.as_ref() {
+    let workspace_path = PathBuf::from(&workspace_record.path);
+    let branch_value = branch.clone();
+    let exists = tauri::async_runtime::spawn_blocking(move || {
+      branch_exists(&workspace_path, &branch_value)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())?;
+    if !exists {
+      return Err(format!("Target branch does not exist: {branch}"));
+    }
+  }
+  workspace::set_workspace_target_branch(
+    db.pool(),
+    &workspace_id,
+    normalized.as_deref(),
+  )
+  .await
+  .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn createPullRequest(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+) -> Result<PullRequestInfo, String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo = repos::get_repo_by_id(db.pool(), &workspace_record.repo_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo_slug = repo
+    .remote_url
+    .as_deref()
+    .and_then(parse_github_repo_slug)
+    .ok_or_else(|| "Repository remote is not a GitHub URL.".to_string())?;
+  let head_branch = workspace_record.branch.clone();
+  let base_branch = workspace_record
+    .intended_target_branch
+    .as_deref()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .unwrap_or(repo.default_branch.as_str())
+    .to_string();
+  let workspace_path = PathBuf::from(&workspace_record.path);
+  let repo_slug_clone = repo_slug.clone();
+  let head_branch_clone = head_branch.clone();
+  let base_branch_clone = base_branch.clone();
+  let info = tauri::async_runtime::spawn_blocking(move || -> Result<PullRequestInfo, String> {
+    ensure_github_authenticated()?;
+    if let Some(status) =
+      fetch_pull_request_status(&workspace_path, &repo_slug_clone)?
+    {
+      return Ok(PullRequestInfo {
+        number: status.number,
+        url: status.url,
+        base_branch: status.base_branch,
+        head_branch: status.head_branch,
+      });
+    }
+    push_branch(&workspace_path, &head_branch_clone)?;
+    create_pull_request(
+      &workspace_path,
+      &repo_slug_clone,
+      &head_branch_clone,
+      &base_branch_clone,
+    )?;
+    let status = fetch_pull_request_status(&workspace_path, &repo_slug_clone)?
+      .ok_or_else(|| "Pull request created but not found.".to_string())?;
+    Ok(PullRequestInfo {
+      number: status.number,
+      url: status.url,
+      base_branch: status.base_branch,
+      head_branch: status.head_branch,
+    })
+  })
+  .await
+  .map_err(|err| err.to_string())?
+  .map_err(|err| err.to_string())?;
+  workspace::set_workspace_pr_info(
+    db.pool(),
+    &workspace_id,
+    Some(info.number),
+    Some(&info.url),
+  )
+  .await
+  .map_err(|err| err.to_string())?;
+  Ok(info)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn getPullRequestStatus(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+) -> Result<Option<PullRequestStatus>, String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo = repos::get_repo_by_id(db.pool(), &workspace_record.repo_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo_slug = repo
+    .remote_url
+    .as_deref()
+    .and_then(parse_github_repo_slug)
+    .ok_or_else(|| "Repository remote is not a GitHub URL.".to_string())?;
+  let workspace_path = PathBuf::from(&workspace_record.path);
+  let repo_slug_clone = repo_slug.clone();
+  let status = tauri::async_runtime::spawn_blocking(move || {
+    ensure_github_authenticated()?;
+    fetch_pull_request_status(&workspace_path, &repo_slug_clone)
+  })
+  .await
+  .map_err(|err| err.to_string())?
+  .map_err(|err| err.to_string())?;
+  if let Some(ref pr) = status {
+    workspace::set_workspace_pr_info(
+      db.pool(),
+      &workspace_id,
+      Some(pr.number),
+      Some(&pr.url),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+  }
+  Ok(status)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn getPullRequestFailureLogs(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+) -> Result<String, String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo = repos::get_repo_by_id(db.pool(), &workspace_record.repo_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo_slug = repo
+    .remote_url
+    .as_deref()
+    .and_then(parse_github_repo_slug)
+    .ok_or_else(|| "Repository remote is not a GitHub URL.".to_string())?;
+  let workspace_path = PathBuf::from(&workspace_record.path);
+  let repo_slug_clone = repo_slug.clone();
+  tauri::async_runtime::spawn_blocking(move || {
+    ensure_github_authenticated()?;
+    let status = fetch_pull_request_status(&workspace_path, &repo_slug_clone)?
+      .ok_or_else(|| "No pull request found for this branch.".to_string())?;
+    build_failure_logs(&workspace_path, &repo_slug_clone, &status.failing_checks)
+  })
+  .await
+  .map_err(|err| err.to_string())?
+  .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn fetchPullRequestComments(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+) -> Result<PullRequestCommentsResult, String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo = repos::get_repo_by_id(db.pool(), &workspace_record.repo_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo_slug = repo
+    .remote_url
+    .as_deref()
+    .and_then(parse_github_repo_slug)
+    .ok_or_else(|| "Repository remote is not a GitHub URL.".to_string())?;
+  let workspace_path = PathBuf::from(&workspace_record.path);
+  let repo_slug_clone = repo_slug.clone();
+  let last_comment_id = workspace_record.pr_last_comment_id.clone();
+  let pr_number = workspace_record.pr_number;
+  let (result, latest_id) = tauri::async_runtime::spawn_blocking(move || {
+    ensure_github_authenticated()?;
+    let number = if let Some(existing) = pr_number {
+      existing
+    } else {
+      let status = fetch_pull_request_status(&workspace_path, &repo_slug_clone)?
+        .ok_or_else(|| "No pull request found for this branch.".to_string())?;
+      status.number
+    };
+    fetch_pull_request_comments(
+      &workspace_path,
+      &repo_slug_clone,
+      number,
+      last_comment_id.as_deref(),
+    )
+  })
+  .await
+  .map_err(|err| err.to_string())?
+  .map_err(|err| err.to_string())?;
+  if let Some(latest) = latest_id {
+    let latest_value = latest.to_string();
+    if workspace_record.pr_last_comment_id.as_deref() != Some(latest_value.as_str()) {
+      workspace::set_workspace_pr_last_comment_id(
+        db.pool(),
+        &workspace_id,
+        Some(&latest_value),
+      )
+      .await
+      .map_err(|err| err.to_string())?;
+    }
+  }
+  if result.new_comments {
+    workspace::set_workspace_unread(db.pool(), &workspace_id, true)
+      .await
+      .map_err(|err| err.to_string())?;
+  }
+  Ok(result)
+}
+
 fn spawn_run_output_reader(
   reader: impl Read + Send + 'static,
   window: tauri::Window,
@@ -1532,6 +1861,510 @@ fn sanitize_filename(value: &str) -> String {
   }
 }
 
+fn configure_gh_command(command: &mut Command) {
+  command.env("GH_PAGER", "cat");
+  command.env("GH_NO_UPDATE_NOTIFIER", "1");
+  command.env("GH_PROMPT_DISABLED", "1");
+}
+
+fn run_command(command: &mut Command, label: &str) -> Result<std::process::Output, String> {
+  command.output().map_err(|err| format!("{label} failed: {err}"))
+}
+
+fn run_command_output(command: &mut Command, label: &str) -> Result<String, String> {
+  let output = run_command(command, label)?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  if !output.status.success() {
+    let message = if !stderr.trim().is_empty() {
+      stderr.trim().to_string()
+    } else if !stdout.trim().is_empty() {
+      stdout.trim().to_string()
+    } else {
+      format!("exit code {:?}", output.status.code())
+    };
+    return Err(format!("{label} failed: {message}"));
+  }
+  Ok(stdout.trim().to_string())
+}
+
+fn detect_github_auth_status() -> GithubAuthStatus {
+  let mut command = Command::new("gh");
+  command.args(["auth", "status", "--hostname", "github.com"]);
+  configure_gh_command(&mut command);
+  match command.output() {
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => GithubAuthStatus {
+      available: false,
+      authenticated: false,
+      message: Some("GitHub CLI (gh) is not installed.".to_string()),
+    },
+    Err(err) => GithubAuthStatus {
+      available: false,
+      authenticated: false,
+      message: Some(format!("Failed to run GitHub CLI: {err}")),
+    },
+    Ok(output) => {
+      let stdout = String::from_utf8_lossy(&output.stdout);
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      let message = if !stderr.trim().is_empty() {
+        Some(stderr.trim().to_string())
+      } else if !stdout.trim().is_empty() {
+        Some(stdout.trim().to_string())
+      } else {
+        None
+      };
+      GithubAuthStatus {
+        available: true,
+        authenticated: output.status.success(),
+        message,
+      }
+    }
+  }
+}
+
+fn ensure_github_authenticated() -> Result<(), String> {
+  let status = detect_github_auth_status();
+  if !status.available {
+    return Err(status
+      .message
+      .unwrap_or_else(|| "GitHub CLI (gh) is not available.".to_string()));
+  }
+  if !status.authenticated {
+    return Err(status.message.unwrap_or_else(|| {
+      "GitHub CLI is not authenticated. Run `gh auth login`.".to_string()
+    }));
+  }
+  Ok(())
+}
+
+fn parse_github_repo_slug(remote_url: &str) -> Option<String> {
+  let trimmed = remote_url.trim();
+  let index = trimmed.find("github.com")?;
+  let mut remainder = &trimmed[index + "github.com".len()..];
+  remainder = remainder.trim_start_matches([':', '/']);
+  remainder = remainder.trim_end_matches(".git");
+  remainder = remainder.trim_end_matches('/');
+  let mut parts = remainder.split('/');
+  let owner = parts.next()?.trim();
+  let repo = parts.next()?.trim();
+  if owner.is_empty() || repo.is_empty() {
+    return None;
+  }
+  Some(format!("{owner}/{repo}"))
+}
+
+fn push_branch(workspace_path: &Path, branch: &str) -> Result<(), String> {
+  let mut command = Command::new("git");
+  command
+    .arg("-C")
+    .arg(workspace_path)
+    .arg("push")
+    .arg("-u")
+    .arg("origin")
+    .arg(branch)
+    .env("GIT_TERMINAL_PROMPT", "0");
+  run_command_output(&mut command, "git push")?;
+  Ok(())
+}
+
+fn create_pull_request(
+  workspace_path: &Path,
+  repo_slug: &str,
+  head_branch: &str,
+  base_branch: &str,
+) -> Result<(), String> {
+  let mut command = Command::new("gh");
+  command.current_dir(workspace_path);
+  command.args([
+    "pr",
+    "create",
+    "--repo",
+    repo_slug,
+    "--head",
+    head_branch,
+    "--base",
+    base_branch,
+    "--title",
+    head_branch,
+    "--body",
+    "Created by Supertree.",
+  ]);
+  configure_gh_command(&mut command);
+  run_command_output(&mut command, "gh pr create")?;
+  Ok(())
+}
+
+fn fetch_pull_request_status(
+  workspace_path: &Path,
+  repo_slug: &str,
+) -> Result<Option<PullRequestStatus>, String> {
+  let mut command = Command::new("gh");
+  command.current_dir(workspace_path);
+  command.args([
+    "pr",
+    "view",
+    "--json",
+    "number,url,baseRefName,headRefName,reviewDecision,mergeable,state,statusCheckRollup",
+    "--repo",
+    repo_slug,
+  ]);
+  configure_gh_command(&mut command);
+  let output = run_command(&mut command, "gh pr view")?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  if !output.status.success() {
+    let combined = format!("{stdout}\n{stderr}");
+    let normalized = combined.to_lowercase();
+    if normalized.contains("no pull request") || normalized.contains("no pull requests") {
+      return Ok(None);
+    }
+    let message = if !stderr.trim().is_empty() {
+      stderr.trim().to_string()
+    } else {
+      stdout.trim().to_string()
+    };
+    return Err(format!("gh pr view failed: {message}"));
+  }
+  let parsed: Value =
+    serde_json::from_str(&stdout).map_err(|err| format!("Failed to parse PR data: {err}"))?;
+  let status = parse_pull_request_status(&parsed)?;
+  Ok(Some(status))
+}
+
+fn parse_pull_request_status(value: &Value) -> Result<PullRequestStatus, String> {
+  let number = value
+    .get("number")
+    .and_then(|val| val.as_i64())
+    .ok_or_else(|| "PR number missing from GitHub response.".to_string())?;
+  let url = value
+    .get("url")
+    .and_then(|val| val.as_str())
+    .ok_or_else(|| "PR url missing from GitHub response.".to_string())?
+    .to_string();
+  let base_branch = value
+    .get("baseRefName")
+    .and_then(|val| val.as_str())
+    .unwrap_or("main")
+    .to_string();
+  let head_branch = value
+    .get("headRefName")
+    .and_then(|val| val.as_str())
+    .unwrap_or("head")
+    .to_string();
+  let review_decision = value
+    .get("reviewDecision")
+    .and_then(|val| val.as_str())
+    .map(|val| val.to_string());
+  let mergeable = value
+    .get("mergeable")
+    .and_then(|val| val.as_str())
+    .map(|val| val.to_string());
+  let state = value
+    .get("state")
+    .and_then(|val| val.as_str())
+    .map(|val| val.to_string());
+  let mut summary = PullRequestCheckSummary {
+    total: 0,
+    failed: 0,
+    pending: 0,
+    success: 0,
+  };
+  let mut failing_checks = Vec::new();
+  if let Some(checks) = value.get("statusCheckRollup").and_then(|val| val.as_array()) {
+    for check in checks {
+      let name = check
+        .get("name")
+        .or_else(|| check.get("context"))
+        .and_then(|val| val.as_str())
+        .unwrap_or("Check")
+        .to_string();
+      let status = check.get("status").and_then(|val| val.as_str()).map(|val| val.to_string());
+      let conclusion =
+        check.get("conclusion").and_then(|val| val.as_str()).map(|val| val.to_string());
+      let state_value = check.get("state").and_then(|val| val.as_str()).map(|val| val.to_string());
+      let normalized_status = status.clone().or_else(|| state_value.clone());
+      let normalized_conclusion = conclusion.clone().or_else(|| state_value.clone());
+      let details_url = check
+        .get("detailsUrl")
+        .or_else(|| check.get("targetUrl"))
+        .or_else(|| check.get("url"))
+        .and_then(|val| val.as_str())
+        .map(|val| val.to_string());
+      let check_entry = PullRequestCheck {
+        name,
+        status: normalized_status.clone(),
+        conclusion: normalized_conclusion.clone(),
+        details_url,
+      };
+      summary.total += 1;
+      match classify_check(
+        normalized_status.as_deref(),
+        normalized_conclusion.as_deref(),
+      ) {
+        CheckOutcome::Success => summary.success += 1,
+        CheckOutcome::Pending => summary.pending += 1,
+        CheckOutcome::Failed => {
+          summary.failed += 1;
+          failing_checks.push(check_entry.clone());
+        }
+      }
+    }
+  }
+  Ok(PullRequestStatus {
+    number,
+    url,
+    base_branch,
+    head_branch,
+    review_decision,
+    mergeable,
+    state,
+    checks: summary,
+    failing_checks,
+  })
+}
+
+enum CheckOutcome {
+  Success,
+  Pending,
+  Failed,
+}
+
+fn classify_check(status: Option<&str>, conclusion: Option<&str>) -> CheckOutcome {
+  let normalized_status = status.unwrap_or("").trim().to_uppercase();
+  let normalized_conclusion = conclusion.unwrap_or("").trim().to_uppercase();
+  if !normalized_conclusion.is_empty() {
+    return match normalized_conclusion.as_str() {
+      "SUCCESS" | "NEUTRAL" | "SKIPPED" => CheckOutcome::Success,
+      "PENDING" | "IN_PROGRESS" | "QUEUED" => CheckOutcome::Pending,
+      _ => CheckOutcome::Failed,
+    };
+  }
+  if !normalized_status.is_empty() {
+    return match normalized_status.as_str() {
+      "IN_PROGRESS" | "QUEUED" | "PENDING" | "REQUESTED" => CheckOutcome::Pending,
+      "SUCCESS" | "COMPLETED" => CheckOutcome::Success,
+      "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" => CheckOutcome::Failed,
+      _ => CheckOutcome::Pending,
+    };
+  }
+  CheckOutcome::Pending
+}
+
+fn extract_run_id(details_url: &str) -> Option<String> {
+  let marker = "/actions/runs/";
+  let index = details_url.find(marker)?;
+  let remainder = &details_url[index + marker.len()..];
+  let id: String = remainder.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+  if id.is_empty() {
+    None
+  } else {
+    Some(id)
+  }
+}
+
+fn fetch_run_logs(workspace_path: &Path, repo_slug: &str, run_id: &str) -> Result<String, String> {
+  let mut command = Command::new("gh");
+  command.current_dir(workspace_path);
+  command.args(["run", "view", run_id, "--log", "--repo", repo_slug]);
+  configure_gh_command(&mut command);
+  run_command_output(&mut command, "gh run view")
+}
+
+fn build_failure_logs(
+  workspace_path: &Path,
+  repo_slug: &str,
+  checks: &[PullRequestCheck],
+) -> Result<String, String> {
+  if checks.is_empty() {
+    return Err("No failing checks found for this pull request.".to_string());
+  }
+  let mut output = String::new();
+  let mut seen_runs = HashSet::new();
+  for check in checks {
+    output.push_str(&format!("## {}\n", check.name));
+    if let Some(status) = check.status.as_deref() {
+      output.push_str(&format!("Status: {status}\n"));
+    }
+    if let Some(conclusion) = check.conclusion.as_deref() {
+      output.push_str(&format!("Conclusion: {conclusion}\n"));
+    }
+    if let Some(details) = check.details_url.as_deref() {
+      output.push_str(&format!("Details: {details}\n"));
+      if let Some(run_id) = extract_run_id(details) {
+        if seen_runs.insert(run_id.clone()) {
+          output.push('\n');
+          match fetch_run_logs(workspace_path, repo_slug, &run_id) {
+            Ok(logs) => {
+              output.push_str(&logs);
+              if !logs.ends_with('\n') {
+                output.push('\n');
+              }
+            }
+            Err(err) => {
+              output.push_str(&format!("Failed to fetch logs for run {run_id}: {err}\n"));
+            }
+          }
+        } else {
+          output.push_str(&format!("Logs already captured for run {run_id}.\n"));
+        }
+      } else {
+        output.push_str("Unable to extract a GitHub Actions run id from the details URL.\n");
+      }
+    } else {
+      output.push_str("No details URL available for this check.\n");
+    }
+    output.push('\n');
+  }
+  Ok(output)
+}
+
+fn run_gh_api(
+  workspace_path: &Path,
+  repo_slug: &str,
+  endpoint: &str,
+) -> Result<Vec<Value>, String> {
+  let mut command = Command::new("gh");
+  command.current_dir(workspace_path);
+  command.args([
+    "api",
+    "-H",
+    "Accept: application/vnd.github+json",
+    &format!("repos/{repo_slug}/{endpoint}"),
+  ]);
+  configure_gh_command(&mut command);
+  let output = run_command_output(&mut command, "gh api")?;
+  serde_json::from_str::<Vec<Value>>(&output)
+    .map_err(|err| format!("Failed to parse GitHub response: {err}"))
+}
+
+fn fetch_pull_request_comments(
+  workspace_path: &Path,
+  repo_slug: &str,
+  pr_number: i64,
+  last_comment_id: Option<&str>,
+) -> Result<(PullRequestCommentsResult, Option<i64>), String> {
+  let reviews = run_gh_api(workspace_path, repo_slug, &format!("pulls/{pr_number}/reviews"))?;
+  let review_comments =
+    run_gh_api(workspace_path, repo_slug, &format!("pulls/{pr_number}/comments"))?;
+  let issue_comments =
+    run_gh_api(workspace_path, repo_slug, &format!("issues/{pr_number}/comments"))?;
+  let (content, latest_id) = format_pr_comments(&reviews, &review_comments, &issue_comments);
+  let last_seen = last_comment_id.and_then(|value| value.parse::<i64>().ok());
+  let new_comments = latest_id
+    .map(|value| last_seen.map(|last| value > last).unwrap_or(true))
+    .unwrap_or(false);
+  Ok((PullRequestCommentsResult { content, new_comments }, latest_id))
+}
+
+fn format_pr_comments(
+  reviews: &[Value],
+  review_comments: &[Value],
+  issue_comments: &[Value],
+) -> (String, Option<i64>) {
+  let mut latest_id: Option<i64> = None;
+  let mut output = String::new();
+  let mut has_any = false;
+
+  let mut track_id = |id: Option<i64>| {
+    if let Some(value) = id {
+      latest_id = Some(latest_id.map_or(value, |current| current.max(value)));
+    }
+  };
+
+  if !reviews.is_empty() {
+    has_any = true;
+    output.push_str("## Reviews\n");
+    for review in reviews {
+      track_id(review.get("id").and_then(|val| val.as_i64()));
+      let state = review
+        .get("state")
+        .and_then(|val| val.as_str())
+        .unwrap_or("UNKNOWN");
+      let user = review
+        .get("user")
+        .and_then(|val| val.get("login"))
+        .and_then(|val| val.as_str())
+        .unwrap_or("unknown");
+      let submitted_at = review
+        .get("submitted_at")
+        .and_then(|val| val.as_str())
+        .unwrap_or("unknown date");
+      output.push_str(&format!("- {state} by {user} ({submitted_at})\n"));
+      if let Some(body) = review.get("body").and_then(|val| val.as_str()) {
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+          output.push_str(&format!("  {trimmed}\n"));
+        }
+      }
+    }
+    output.push('\n');
+  }
+
+  if !review_comments.is_empty() {
+    has_any = true;
+    output.push_str("## Inline comments\n");
+    for comment in review_comments {
+      track_id(comment.get("id").and_then(|val| val.as_i64()));
+      let path = comment.get("path").and_then(|val| val.as_str()).unwrap_or("file");
+      let line = comment
+        .get("line")
+        .or_else(|| comment.get("position"))
+        .or_else(|| comment.get("original_line"))
+        .and_then(|val| val.as_i64())
+        .map(|val| val.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+      let user = comment
+        .get("user")
+        .and_then(|val| val.get("login"))
+        .and_then(|val| val.as_str())
+        .unwrap_or("unknown");
+      let created_at = comment
+        .get("created_at")
+        .and_then(|val| val.as_str())
+        .unwrap_or("unknown date");
+      output.push_str(&format!("- {path}:{line} by {user} ({created_at})\n"));
+      if let Some(body) = comment.get("body").and_then(|val| val.as_str()) {
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+          output.push_str(&format!("  {trimmed}\n"));
+        }
+      }
+    }
+    output.push('\n');
+  }
+
+  if !issue_comments.is_empty() {
+    has_any = true;
+    output.push_str("## Issue comments\n");
+    for comment in issue_comments {
+      track_id(comment.get("id").and_then(|val| val.as_i64()));
+      let user = comment
+        .get("user")
+        .and_then(|val| val.get("login"))
+        .and_then(|val| val.as_str())
+        .unwrap_or("unknown");
+      let created_at = comment
+        .get("created_at")
+        .and_then(|val| val.as_str())
+        .unwrap_or("unknown date");
+      output.push_str(&format!("- {user} ({created_at})\n"));
+      if let Some(body) = comment.get("body").and_then(|val| val.as_str()) {
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+          output.push_str(&format!("  {trimmed}\n"));
+        }
+      }
+    }
+    output.push('\n');
+  }
+
+  if !has_any {
+    output.clear();
+  }
+
+  (output, latest_id)
+}
+
 const MAX_WORKSPACE_FILES: usize = 2000;
 const MAX_FILE_PREVIEW_BYTES: usize = 200_000;
 
@@ -1932,6 +2765,13 @@ fn main() {
       readWorkspaceFile,
       getWorkspaceGitStatus,
       getWorkspaceDiff,
+      getGithubAuthStatus,
+      listRepoBranches,
+      setWorkspaceTargetBranch,
+      createPullRequest,
+      getPullRequestStatus,
+      getPullRequestFailureLogs,
+      fetchPullRequestComments,
       startRunScript,
       stopRunScript,
       createTerminal,
