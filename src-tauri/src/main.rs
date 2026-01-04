@@ -1072,9 +1072,6 @@ async fn resetSessionToTurn(
   let session = sessions::get_session(db.pool(), &payload.session_id)
     .await
     .map_err(|err| err.to_string())?;
-  let workspace_record = workspace::get_workspace(db.pool(), &session.workspace_id)
-    .await
-    .map_err(|err| err.to_string())?;
   let checkpoint = sessions::get_session_message_checkpoint(
     db.pool(),
     &session.id,
@@ -1094,6 +1091,8 @@ async fn resetSessionToTurn(
   else {
     return Err("Checkpoint is unavailable for this turn".to_string());
   };
+  let expected_workspace_id = session.workspace_id.clone();
+  let expected_status = session.status.clone();
 
   let workspace_sessions = sessions::list_workspace_sessions(db.pool(), &session.workspace_id)
     .await
@@ -1111,7 +1110,36 @@ async fn resetSessionToTurn(
   }
   sidecar.close_session(&session.id).await;
 
-  let workspace_path = PathBuf::from(&workspace_record.path);
+  let refreshed_session = sessions::get_session(db.pool(), &session.id)
+    .await
+    .map_err(|_| "Session no longer exists".to_string())?;
+  if refreshed_session.workspace_id != expected_workspace_id {
+    return Err("Session workspace changed".to_string());
+  }
+  if refreshed_session.status != expected_status {
+    return Err("Session status changed".to_string());
+  }
+  let refreshed_workspace = workspace::get_workspace(db.pool(), &expected_workspace_id)
+    .await
+    .map_err(|_| "Workspace no longer exists".to_string())?;
+  let next_turn_id = sessions::next_turn_id(db.pool(), &session.id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let max_turn_id = next_turn_id.saturating_sub(1);
+  if payload.turn_id <= 0 || payload.turn_id > max_turn_id {
+    return Err("Invalid turn_id".to_string());
+  }
+  let refreshed_sessions =
+    sessions::list_workspace_sessions(db.pool(), &expected_workspace_id)
+      .await
+      .map_err(|err| err.to_string())?;
+  if refreshed_sessions.iter().any(|item| {
+    item.id != session.id && matches!(item.status.as_str(), "running")
+  }) {
+    return Err("Conflicting running session".to_string());
+  }
+
+  let workspace_path = PathBuf::from(&refreshed_workspace.path);
   let rollback_checkpoint_id = {
     let stamp = SystemTime::now()
       .duration_since(UNIX_EPOCH)
