@@ -716,8 +716,36 @@ async fn sendSessionMessage(
   .map_err(|err| err.to_string())?;
   let turn_id = user_message.turn_id;
 
+  let options = build_session_query_options(
+    &session,
+    &workspace_record.path,
+    payload.permission_mode.clone(),
+    &env_vars_raw,
+    turn_id,
+  );
+  if let Err(err) = sidecar
+    .send_query(&session.id, &session.agent_type, prompt, options, turn_id)     
+    .await
+  {
+    let _ = sessions::set_session_status(db.pool(), &session.id, "error").await;
+    return Err(err);
+  }
+  sessions::set_session_status(db.pool(), &session.id, "running")
+    .await
+    .map_err(|err| err.to_string())?;
+
+  Ok(user_message)
+}
+
+fn build_session_query_options(
+  session: &sessions::SessionRecord,
+  workspace_path: &str,
+  permission_mode: Option<String>,
+  env_vars_raw: &str,
+  turn_id: i64,
+) -> Value {
   let mut options = serde_json::Map::new();
-  options.insert("cwd".to_string(), Value::String(workspace_record.path));
+  options.insert("cwd".to_string(), Value::String(workspace_path.to_string()));
   if let Some(model) = session
     .model
     .clone()
@@ -725,11 +753,7 @@ async fn sendSessionMessage(
   {
     options.insert("model".to_string(), Value::String(model));
   }
-  if let Some(permission_mode) = payload
-    .permission_mode
-    .clone()
-    .filter(|value| !value.trim().is_empty())
-  {
+  if let Some(permission_mode) = permission_mode.filter(|value| !value.trim().is_empty()) {
     options.insert(
       "permissionMode".to_string(),
       Value::String(permission_mode),
@@ -759,9 +783,9 @@ async fn sendSessionMessage(
   if !env_vars_raw.trim().is_empty() {
     options.insert(
       "claudeEnvVars".to_string(),
-      Value::String(env_vars_raw.clone()),
+      Value::String(env_vars_raw.to_string()),
     );
-    let parsed = parse_env_vars(&env_vars_raw);
+    let parsed = parse_env_vars(env_vars_raw);
     if !parsed.is_empty() {
       let mut env_map = serde_json::Map::new();
       for (key, value) in parsed {
@@ -771,19 +795,7 @@ async fn sendSessionMessage(
     }
   }
   options.insert("turnId".to_string(), json!(turn_id));
-  let options = Value::Object(options);
-  if let Err(err) = sidecar
-    .send_query(&session.id, &session.agent_type, prompt, options, turn_id)
-    .await
-  {
-    let _ = sessions::set_session_status(db.pool(), &session.id, "error").await;
-    return Err(err);
-  }
-  sessions::set_session_status(db.pool(), &session.id, "running")
-    .await
-    .map_err(|err| err.to_string())?;
-
-  Ok(user_message)
+  Value::Object(options)
 }
 
 #[allow(non_snake_case)]
