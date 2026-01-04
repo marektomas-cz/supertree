@@ -29,12 +29,14 @@ pub struct NewSession {
 }
 
 /// Data required to insert a new session message without a turn id.
+#[allow(dead_code)]
 pub struct NewSessionMessageDraft {
   pub id: String,
   pub session_id: String,
   pub role: String,
   pub content: String,
   pub metadata_json: Option<String>,
+  pub checkpoint_id: Option<String>,
 }
 
 /// Session message record stored in SQLite.
@@ -49,6 +51,7 @@ pub struct SessionMessageRecord {
   pub sent_at: Option<String>,
   pub cancelled_at: Option<String>,
   pub metadata_json: Option<String>,
+  pub checkpoint_id: Option<String>,
 }
 
 /// Data required to insert a new session message record.
@@ -59,6 +62,13 @@ pub struct NewSessionMessage {
   pub role: String,
   pub content: String,
   pub metadata_json: Option<String>,
+  pub checkpoint_id: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct SessionMessageCheckpoint {
+  pub checkpoint_id: Option<String>,
+  pub role: String,
 }
 
 pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<SessionRecord>, DbError> {
@@ -202,7 +212,7 @@ pub async fn list_session_messages(
   session_id: &str,
 ) -> Result<Vec<SessionMessageRecord>, DbError> {
   let rows = sqlx::query_as::<_, SessionMessageRecord>(
-    "SELECT id, session_id, turn_id, role, content, sent_at, cancelled_at, metadata_json
+    "SELECT id, session_id, turn_id, role, content, sent_at, cancelled_at, metadata_json, checkpoint_id
      FROM session_messages
      WHERE session_id = ?
      ORDER BY created_at ASC",
@@ -213,6 +223,7 @@ pub async fn list_session_messages(
   Ok(rows)
 }
 
+#[allow(dead_code)]
 pub async fn insert_session_message_with_next_turn(
   pool: &SqlitePool,
   message: NewSessionMessageDraft,
@@ -226,8 +237,8 @@ pub async fn insert_session_message_with_next_turn(
   .await?;
   sqlx::query(
     "INSERT INTO session_messages
-      (id, session_id, turn_id, role, content, sent_at, metadata_json)
-     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)",
+      (id, session_id, turn_id, role, content, sent_at, metadata_json, checkpoint_id)
+     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)",
   )
   .bind(&message.id)
   .bind(&message.session_id)
@@ -235,6 +246,7 @@ pub async fn insert_session_message_with_next_turn(
   .bind(&message.role)
   .bind(&message.content)
   .bind(&message.metadata_json)
+  .bind(&message.checkpoint_id)
   .execute(&mut *tx)
   .await?;
   tx.commit().await?;
@@ -248,8 +260,8 @@ pub async fn insert_session_message(
 ) -> Result<SessionMessageRecord, DbError> {
   sqlx::query(
     "INSERT INTO session_messages
-      (id, session_id, turn_id, role, content, sent_at, metadata_json)
-     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)",
+      (id, session_id, turn_id, role, content, sent_at, metadata_json, checkpoint_id)
+     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)",
   )
   .bind(&message.id)
   .bind(&message.session_id)
@@ -257,6 +269,7 @@ pub async fn insert_session_message(
   .bind(&message.role)
   .bind(&message.content)
   .bind(&message.metadata_json)
+  .bind(&message.checkpoint_id)
   .execute(pool)
   .await?;
 
@@ -318,7 +331,7 @@ async fn get_session_message(
   message_id: &str,
 ) -> Result<SessionMessageRecord, DbError> {
   let row = sqlx::query_as::<_, SessionMessageRecord>(
-    "SELECT id, session_id, turn_id, role, content, sent_at, cancelled_at, metadata_json
+    "SELECT id, session_id, turn_id, role, content, sent_at, cancelled_at, metadata_json, checkpoint_id
      FROM session_messages
      WHERE id = ?",
   )
@@ -337,6 +350,96 @@ pub async fn count_workspace_sessions(
     .fetch_one(pool)
     .await?;
   Ok(count)
+}
+
+pub async fn next_turn_id(
+  pool: &SqlitePool,
+  session_id: &str,
+) -> Result<i64, DbError> {
+  let next: i64 = sqlx::query_scalar(
+    "SELECT COALESCE(MAX(turn_id), 0) + 1 FROM session_messages WHERE session_id = ?",
+  )
+  .bind(session_id)
+  .fetch_one(pool)
+  .await?;
+  Ok(next)
+}
+
+pub async fn get_session_message_checkpoint(
+  pool: &SqlitePool,
+  session_id: &str,
+  turn_id: i64,
+) -> Result<Option<SessionMessageCheckpoint>, DbError> {
+  let row = sqlx::query_as::<_, SessionMessageCheckpoint>(
+    "SELECT checkpoint_id, role
+     FROM session_messages
+     WHERE session_id = ? AND turn_id = ?",
+  )
+  .bind(session_id)
+  .bind(turn_id)
+  .fetch_optional(pool)
+  .await?;
+  Ok(row)
+}
+
+pub async fn delete_session_messages_from_turn(
+  pool: &SqlitePool,
+  session_id: &str,
+  turn_id: i64,
+) -> Result<(), DbError> {
+  let mut tx = pool.begin().await?;
+  sqlx::query(
+    "DELETE FROM attachments
+     WHERE session_message_id IN (
+       SELECT id FROM session_messages WHERE session_id = ? AND turn_id >= ?
+     )",
+  )
+  .bind(session_id)
+  .bind(turn_id)
+  .execute(&mut *tx)
+  .await?;
+  sqlx::query("DELETE FROM session_messages WHERE session_id = ? AND turn_id >= ?")
+    .bind(session_id)
+    .bind(turn_id)
+    .execute(&mut *tx)
+    .await?;
+  tx.commit().await?;
+  Ok(())
+}
+
+pub async fn list_workspace_sessions(
+  pool: &SqlitePool,
+  workspace_id: &str,
+) -> Result<Vec<SessionRecord>, DbError> {
+  let rows = sqlx::query_as::<_, SessionRecord>(
+    "SELECT id, workspace_id, title, agent_type, model, status, unread_count,
+            claude_session_id, codex_session_id, context_token_count, is_compacted
+     FROM sessions
+     WHERE workspace_id = ?
+     ORDER BY created_at DESC",
+  )
+  .bind(workspace_id)
+  .fetch_all(pool)
+  .await?;
+  Ok(rows)
+}
+
+pub async fn clear_session_resume(
+  pool: &SqlitePool,
+  session_id: &str,
+) -> Result<(), DbError> {
+  let result = sqlx::query(
+    "UPDATE sessions
+     SET claude_session_id = NULL, codex_session_id = NULL, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?",
+  )
+  .bind(session_id)
+  .execute(pool)
+  .await?;
+  if result.rows_affected() == 0 {
+    return Err(DbError::NotFound(format!("Session not found: {session_id}")));
+  }
+  Ok(())
 }
 
 async fn generate_random_id(pool: &SqlitePool) -> Result<String, DbError> {

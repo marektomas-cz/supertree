@@ -38,6 +38,7 @@ type SessionMessageItem = {
   sentAt?: string | null;
   cancelledAt?: string | null;
   metadata?: Record<string, unknown> | null;
+  checkpointId?: string | null;
   streaming?: boolean;
 };
 
@@ -332,6 +333,7 @@ const normalizeSessionMessage = (
   sentAt: message.sentAt ?? null,
   cancelledAt: message.cancelledAt ?? null,
   metadata: parseMetadataJson(message.metadataJson),
+  checkpointId: message.checkpointId ?? null,
   streaming: false,
 });
 
@@ -680,6 +682,7 @@ export default function AppShell() {
   const [pendingIssueId, setPendingIssueId] = useState<string | null>(null);
   const [sessionListError, setSessionListError] = useState<string | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [resettingTurnId, setResettingTurnId] = useState<number | null>(null);
   const [pendingAskQueue, setPendingAskQueue] = useState<AskUserQuestionEvent[]>(
     [],
   );
@@ -769,6 +772,18 @@ export default function AppShell() {
     }
     return sessionStatuses[activeSession.id] ?? activeSession.status ?? 'idle';
   }, [activeSession, sessionStatuses]);
+  const activeWorkspaceSessions = useMemo(() => {
+    if (!activeWorkspaceId) {
+      return [];
+    }
+    return sessionsByWorkspace[activeWorkspaceId] ?? [];
+  }, [activeWorkspaceId, sessionsByWorkspace]);
+  const hasOtherRunningSessions = useMemo(() => {
+    return activeWorkspaceSessions.some((session) => {
+      const status = sessionStatuses[session.id] ?? session.status ?? 'idle';
+      return status === 'running' && session.id !== activeSessionId;
+    });
+  }, [activeWorkspaceSessions, activeSessionId, sessionStatuses]);
   const activeSessionMessages = useMemo(() => {
     if (!activeSessionId) {
       return [];
@@ -1603,6 +1618,7 @@ export default function AppShell() {
             role: message.role,
             content: message.content,
             metadata,
+            checkpointId: null,
             streaming: message.streaming,
           };
           if (index >= 0) {
@@ -1614,6 +1630,7 @@ export default function AppShell() {
               turnId: current.turnId ?? nextItem.turnId,
               sentAt: current.sentAt ?? nextItem.sentAt,
               cancelledAt: current.cancelledAt ?? nextItem.cancelledAt,
+              checkpointId: current.checkpointId ?? nextItem.checkpointId,
             };
             return { ...prev, [sessionId]: updated };
           }
@@ -2473,6 +2490,63 @@ export default function AppShell() {
       setSendError(String(err));
     }
   }, [activeSession]);
+
+  const handleResetToTurn = useCallback(
+    async (turnId?: number) => {
+      if (!activeSession || !activeWorkspaceId || turnId === undefined) {
+        return;
+      }
+      if (hasOtherRunningSessions) {
+        setSessionErrors((prev) => ({
+          ...prev,
+          [activeSession.id]:
+            'Stop other running sessions in this workspace before resetting.',
+        }));
+        return;
+      }
+      const confirmed = globalThis.confirm?.(
+        'Reset to this point? This will discard all messages and code changes after this turn.',
+      );
+      if (!confirmed) {
+        return;
+      }
+      setSendError(null);
+      setSessionErrors((prev) => ({ ...prev, [activeSession.id]: null }));
+      setResettingTurnId(turnId);
+      try {
+        await invoke('resetSessionToTurn', {
+          sessionId: activeSession.id,
+          turnId,
+        });
+        await loadSessionMessages(activeSession.id);
+        await loadSessionAttachments(activeSession.id);
+        await loadSessions();
+        await loadGitStatus(activeWorkspaceId);
+        const selectedDiff = selectedDiffPathByWorkspace[activeWorkspaceId] ?? null;
+        await loadWorkspaceDiff(activeWorkspaceId, selectedDiff);
+        setSessionStatuses((prev) => ({ ...prev, [activeSession.id]: 'idle' }));
+        setPlanModeBySession((prev) => ({ ...prev, [activeSession.id]: false }));
+      } catch (err) {
+        setSessionErrors((prev) => ({
+          ...prev,
+          [activeSession.id]: String(err),
+        }));
+      } finally {
+        setResettingTurnId(null);
+      }
+    },
+    [
+      activeSession,
+      activeWorkspaceId,
+      hasOtherRunningSessions,
+      loadGitStatus,
+      loadSessionAttachments,
+      loadSessionMessages,
+      loadSessions,
+      loadWorkspaceDiff,
+      selectedDiffPathByWorkspace,
+    ],
+  );
 
   const handlePermissionModeChange = useCallback(
     async (mode: string) => {
@@ -4534,10 +4608,17 @@ export default function AppShell() {
                           const attachments = activeSessionAttachments.filter(
                             (item) => item.sessionMessageId === message.id,
                           );
+                          const canResetMessage =
+                            message.role === 'user' &&
+                            message.turnId !== undefined &&
+                            Boolean(message.checkpointId) &&
+                            activeSession?.agentType === 'claude' &&
+                            !hasOtherRunningSessions;
+                          const isResetting = resettingTurnId === message.turnId;
                           return (
                             <div
                               key={message.id}
-                              className={`rounded-lg border p-4 ${
+                              className={`group rounded-lg border p-4 ${
                                 message.role === 'user'
                                   ? 'border-slate-800 bg-slate-900/60'
                                   : 'border-slate-800 bg-slate-950/70'
@@ -4550,13 +4631,27 @@ export default function AppShell() {
                                     <span className="text-emerald-400">Streaming…</span>
                                   ) : null}
                                 </div>
-                                <button
-                                  type="button"
-                                  onClick={() => handleCopyMessage(message.content)}
-                                  className="rounded-md border border-slate-800 px-2 py-1 text-[10px] uppercase tracking-widest text-slate-500 transition hover:bg-slate-900 hover:text-slate-100"
-                                >
-                                  Copy
-                                </button>
+                                <div className="flex items-center gap-2">
+                                  {canResetMessage ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleResetToTurn(message.turnId)}
+                                      disabled={isResetting}
+                                      title="Reset to this point"
+                                      aria-label="Reset to this point"
+                                      className="rounded-md border border-slate-800 px-2 py-1 text-[10px] uppercase tracking-widest text-slate-500 opacity-0 transition group-hover:opacity-100 focus-visible:opacity-100 disabled:cursor-not-allowed disabled:opacity-40 hover:bg-slate-900 hover:text-slate-100"
+                                    >
+                                      ↺
+                                    </button>
+                                  ) : null}
+                                  <button
+                                    type="button"
+                                    onClick={() => handleCopyMessage(message.content)}
+                                    className="rounded-md border border-slate-800 px-2 py-1 text-[10px] uppercase tracking-widest text-slate-500 transition hover:bg-slate-900 hover:text-slate-100"
+                                  >
+                                    Copy
+                                  </button>
+                                </div>
                               </div>
                               <div className="mt-2 space-y-2">
                                 {renderMarkdownContent(

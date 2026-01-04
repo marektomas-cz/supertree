@@ -25,6 +25,7 @@ export type SessionMessageRecord = {
   sentAt?: string | null;
   cancelledAt?: string | null;
   metadataJson?: string | null;
+  checkpointId?: string | null;
 };
 
 export type SessionMessageEvent = {

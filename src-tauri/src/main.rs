@@ -2,6 +2,7 @@
 
 mod db;
 mod git;
+mod checkpoints;
 mod attachments;
 mod path_utils;
 mod paths;
@@ -32,6 +33,7 @@ use libc;
 
 use crate::db::{Database, DbError};
 use crate::attachments::AttachmentRecord;
+use crate::checkpoints::{create_checkpoint, restore_checkpoint, CheckpointOutcome};
 use crate::git::{
   branch_exists, clone_repo, create_worktree, diff as git_diff, inspect_repo, is_git_repo,
   list_branches, list_status, read_supertree_config, remove_worktree, repo_name_from_url,
@@ -221,6 +223,13 @@ struct SendSessionMessageRequest {
   prompt: String,
   permission_mode: Option<String>,
   attachment_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetSessionToTurnRequest {
+  session_id: String,
+  turn_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -892,14 +901,37 @@ async fn sendSessionMessage(
     .await
     .map_err(|err| err.to_string())?;
 
-  let user_message = sessions::insert_session_message_with_next_turn(
+  let next_turn_id = sessions::next_turn_id(db.pool(), &session.id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let checkpoint_id = if session.agent_type == "claude" {
+    let checkpoint_id = format!("session-{}-turn-{}-user", session.id, next_turn_id);
+    let workspace_path = PathBuf::from(&workspace_record.path);
+    match create_checkpoint(&workspace_path, &checkpoint_id) {
+      Ok(CheckpointOutcome::Created) => Some(checkpoint_id),
+      Ok(CheckpointOutcome::Skipped { reason }) => {
+        eprintln!(
+          "[checkpoint] skipped for session {} turn {}: {}",
+          session.id, next_turn_id, reason
+        );
+        None
+      }
+      Err(err) => return Err(err.to_string()),
+    }
+  } else {
+    None
+  };
+
+  let user_message = sessions::insert_session_message(
     db.pool(),
-    sessions::NewSessionMessageDraft {
+    sessions::NewSessionMessage {
       id: message_id,
       session_id: session.id.clone(),
+      turn_id: next_turn_id,
       role: "user".to_string(),
       content: prompt.to_string(),
       metadata_json: None,
+      checkpoint_id,
     },
   )
   .await
@@ -1017,6 +1049,70 @@ async fn cancelSession(
   sessions::set_session_status(db.pool(), &session.id, "idle")
     .await
     .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn resetSessionToTurn(
+  db: tauri::State<'_, Database>,
+  sidecar: tauri::State<'_, SidecarManager>,
+  payload: ResetSessionToTurnRequest,
+) -> Result<(), String> {
+  let session = sessions::get_session(db.pool(), &payload.session_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let workspace_record = workspace::get_workspace(db.pool(), &session.workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let checkpoint = sessions::get_session_message_checkpoint(
+    db.pool(),
+    &session.id,
+    payload.turn_id,
+  )
+  .await
+  .map_err(|err| err.to_string())?;
+  let Some(checkpoint) = checkpoint else {
+    return Err("Checkpoint not found for this turn".to_string());
+  };
+  if checkpoint.role != "user" {
+    return Err("Reset is only supported for user messages".to_string());
+  }
+  let Some(checkpoint_id) = checkpoint
+    .checkpoint_id
+    .filter(|value| !value.trim().is_empty())
+  else {
+    return Err("Checkpoint is unavailable for this turn".to_string());
+  };
+
+  let workspace_sessions = sessions::list_workspace_sessions(db.pool(), &session.workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  if workspace_sessions.iter().any(|item| {
+    item.id != session.id && matches!(item.status.as_str(), "running")
+  }) {
+    return Err("Another session is running in this workspace".to_string());
+  }
+
+  if matches!(session.status.as_str(), "running") {
+    sidecar
+      .cancel(&session.id, &session.agent_type)
+      .await?;
+  }
+  sidecar.close_session(&session.id).await;
+
+  let workspace_path = PathBuf::from(&workspace_record.path);
+  restore_checkpoint(&workspace_path, &checkpoint_id).map_err(|err| err.to_string())?;
+  sessions::delete_session_messages_from_turn(db.pool(), &session.id, payload.turn_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  sessions::clear_session_resume(db.pool(), &session.id)
+    .await
+    .map_err(|err| err.to_string())?;
+  sessions::set_session_status(db.pool(), &session.id, "idle")
+    .await
+    .map_err(|err| err.to_string())?;
+
+  Ok(())
 }
 
 #[allow(non_snake_case)]
@@ -2757,6 +2853,7 @@ fn main() {
       markWorkspaceUnread,
       sendSessionMessage,
       cancelSession,
+      resetSessionToTurn,
       updatePermissionMode,
       respondAskUserQuestion,
       respondExitPlanMode,
