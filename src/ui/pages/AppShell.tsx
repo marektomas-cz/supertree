@@ -1636,7 +1636,7 @@ export default function AppShell() {
         ...prev,
         [session.id]: [],
       }));
-      void loadSessionAttachments(session.id);
+      await loadSessionAttachments(session.id);
       if (pendingIssueId) {
         setLinkedIssueBySession((prev) => ({
           ...prev,
@@ -1910,26 +1910,37 @@ export default function AppShell() {
           return;
         }
       }
-      for (const file of nextFiles) {
+      const tasks = nextFiles.map(async (file) => {
         const buffer = await file.arrayBuffer();
         const bytes = Array.from(new Uint8Array(buffer));
-        try {
-          const attachment = await invoke<AttachmentRecord>('createAttachment', {
-            sessionId: session.id,
-            fileName: file.name,
-            mimeType: file.type || undefined,
-            bytes,
-          });
-          setDraftAttachmentsBySession((prev) => {
-            const existing = prev[session.id] ?? [];
-            return {
-              ...prev,
-              [session.id]: [...existing, attachment],
-            };
-          });
-        } catch (err) {
-          setSendError(String(err));
+        return invoke<AttachmentRecord>('createAttachment', {
+          sessionId: session.id,
+          fileName: file.name,
+          mimeType: file.type || undefined,
+          bytes,
+        });
+      });
+      const results = await Promise.allSettled(tasks);
+      const created: AttachmentRecord[] = [];
+      let errorMessage: string | null = null;
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          created.push(result.value);
+        } else {
+          errorMessage = String(result.reason);
         }
+      }
+      if (created.length > 0) {
+        setDraftAttachmentsBySession((prev) => {
+          const existing = prev[session.id] ?? [];
+          return {
+            ...prev,
+            [session.id]: [...existing, ...created],
+          };
+        });
+      }
+      if (errorMessage) {
+        setSendError(errorMessage);
       }
     },
     [
@@ -3671,8 +3682,7 @@ export default function AppShell() {
               {contextUsagePercent !== null ? ` · Context ${contextUsagePercent}%` : ''}
             </span>
           </div>
-          <div
-            role="region"
+          <section
             aria-label="Composer dropzone"
             className="relative mt-3 space-y-3"
             onDragOver={handleComposerDragOver}
@@ -3706,7 +3716,10 @@ export default function AppShell() {
                     <button
                       key={suggestion.id}
                       type="button"
-                      onClick={() => applyComposerSuggestion(suggestion)}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        applyComposerSuggestion(suggestion);
+                      }}
                       className={`flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-xs transition ${
                         index === composerSuggestionIndex
                           ? 'bg-slate-800 text-slate-100'
@@ -3851,7 +3864,7 @@ export default function AppShell() {
                 </Button>
               </div>
             </div>
-          </div>
+          </section>
         </div>
       </main>
 
