@@ -1206,7 +1206,15 @@ fn parse_env_vars(raw: &str) -> Vec<(String, String)> {
       if key.is_empty() {
         return None;
       }
-      let value = value.trim().trim_matches('"').trim_matches('\'');
+      let value = value.trim();
+      let value = if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+          || (value.starts_with('\'') && value.ends_with('\'')))
+      {
+        &value[1..value.len() - 1]
+      } else {
+        value
+      };
       Some((key.to_string(), value.to_string()))
     })
     .collect()

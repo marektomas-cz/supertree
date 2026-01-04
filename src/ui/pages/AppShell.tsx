@@ -1009,19 +1009,20 @@ export default function AppShell() {
           [workspaceId]: String(err),
         }));
       }
+      let remainingSessions: TerminalSession[] = [];
       setTerminalSessionsByWorkspace((prev) => {
         const list = prev[workspaceId] ?? [];
-        const nextList = list.filter((session) => session.id !== terminalId);
-        setActiveTerminalByWorkspace((activePrev) => {
-          if (activePrev[workspaceId] !== terminalId) {
-            return activePrev;
-          }
-          return {
-            ...activePrev,
-            [workspaceId]: nextList[0]?.id ?? null,
-          };
-        });
-        return { ...prev, [workspaceId]: nextList };
+        remainingSessions = list.filter((session) => session.id !== terminalId);
+        return { ...prev, [workspaceId]: remainingSessions };
+      });
+      setActiveTerminalByWorkspace((activePrev) => {
+        if (activePrev[workspaceId] !== terminalId) {
+          return activePrev;
+        }
+        return {
+          ...activePrev,
+          [workspaceId]: remainingSessions[0]?.id ?? null,
+        };
       });
     },
     [],

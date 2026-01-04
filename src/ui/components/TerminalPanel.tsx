@@ -48,6 +48,9 @@ export default function TerminalPanel({
 }: TerminalPanelProps) {
   const instancesRef = useRef<Map<string, TerminalInstance>>(new Map());
   const containersRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const containerCallbacksRef = useRef<
+    Map<string, (element: HTMLDivElement | null) => void>
+  >(new Map());
 
   const attachTerminal = useCallback((terminalId: string) => {
     const instance = instancesRef.current.get(terminalId);
@@ -92,13 +95,22 @@ export default function TerminalPanel({
     });
   }, []);
 
-  const containerRef = useCallback(
-    (terminalId: string) => (element: HTMLDivElement | null) => {
-      if (!element) {
-        return;
+  const getContainerRef = useCallback(
+    (terminalId: string) => {
+      const existing = containerCallbacksRef.current.get(terminalId);
+      if (existing) {
+        return existing;
       }
-      containersRef.current.set(terminalId, element);
-      attachTerminal(terminalId);
+      const callback = (element: HTMLDivElement | null) => {
+        if (!element) {
+          containersRef.current.delete(terminalId);
+          return;
+        }
+        containersRef.current.set(terminalId, element);
+        attachTerminal(terminalId);
+      };
+      containerCallbacksRef.current.set(terminalId, callback);
+      return callback;
     },
     [attachTerminal],
   );
@@ -131,6 +143,7 @@ export default function TerminalPanel({
       instance.terminal.dispose();
       instancesRef.current.delete(terminalId);
       containersRef.current.delete(terminalId);
+      containerCallbacksRef.current.delete(terminalId);
     }
   }, [attachTerminal, sessions]);
 
@@ -238,7 +251,7 @@ export default function TerminalPanel({
           sessions.map((session) => (
             <div
               key={session.id}
-              ref={containerRef(session.id)}
+            ref={getContainerRef(session.id)}
               className={`absolute inset-0 ${
                 session.id === activeSessionId ? 'block' : 'hidden'
               }`}
