@@ -33,7 +33,12 @@ use libc;
 
 use crate::db::{Database, DbError};
 use crate::attachments::AttachmentRecord;
-use crate::checkpoints::{create_checkpoint, restore_checkpoint, CheckpointOutcome};
+use crate::checkpoints::{
+  create_checkpoint,
+  delete_checkpoint,
+  restore_checkpoint,
+  CheckpointOutcome,
+};
 use crate::git::{
   branch_exists, clone_repo, create_worktree, diff as git_diff, inspect_repo, is_git_repo,
   list_branches, list_status, read_supertree_config, remove_worktree, repo_name_from_url,
@@ -1107,10 +1112,59 @@ async fn resetSessionToTurn(
   sidecar.close_session(&session.id).await;
 
   let workspace_path = PathBuf::from(&workspace_record.path);
+  let rollback_checkpoint_id = {
+    let stamp = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map(|duration| duration.as_millis())
+      .unwrap_or(0);
+    format!("session-{}-turn-{}-rollback-{}", session.id, payload.turn_id, stamp)
+  };
+  let rollback_checkpoint = match create_checkpoint(&workspace_path, &rollback_checkpoint_id) {
+    Ok(CheckpointOutcome::Created) => Some(rollback_checkpoint_id),
+    Ok(CheckpointOutcome::Skipped { reason }) => {
+      eprintln!(
+        "[checkpoint] rollback skipped for session {} turn {}: {}",
+        session.id, payload.turn_id, reason
+      );
+      None
+    }
+    Err(err) => {
+      eprintln!(
+        "[checkpoint] rollback checkpoint failed for session {} turn {}: {}",
+        session.id, payload.turn_id, err
+      );
+      None
+    }
+  };
   restore_checkpoint(&workspace_path, &checkpoint_id).map_err(|err| err.to_string())?;
-  sessions::reset_session_to_turn(db.pool(), &session.id, payload.turn_id)
-    .await
-    .map_err(|err| err.to_string())?;
+  if let Err(err) = sessions::reset_session_to_turn(db.pool(), &session.id, payload.turn_id).await
+  {
+    if let Some(rollback_id) = rollback_checkpoint.as_deref() {
+      if let Err(rollback_err) = restore_checkpoint(&workspace_path, rollback_id) {
+        eprintln!(
+          "[checkpoint] rollback restore failed for session {} turn {}: {}",
+          session.id, payload.turn_id, rollback_err
+        );
+      }
+      if let Err(cleanup_err) = delete_checkpoint(&workspace_path, rollback_id) {
+        eprintln!(
+          "[checkpoint] rollback cleanup failed for session {} turn {}: {}",
+          session.id, payload.turn_id, cleanup_err
+        );
+      }
+    }
+    return Err(format!(
+      "Reset failed after restoring checkpoint; workspace may be reverted: {err}"
+    ));
+  }
+  if let Some(rollback_id) = rollback_checkpoint.as_deref() {
+    if let Err(cleanup_err) = delete_checkpoint(&workspace_path, rollback_id) {
+      eprintln!(
+        "[checkpoint] rollback cleanup failed for session {} turn {}: {}",
+        session.id, payload.turn_id, cleanup_err
+      );
+    }
+  }
 
   Ok(())
 }

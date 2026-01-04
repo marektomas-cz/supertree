@@ -19,6 +19,7 @@ pub enum CheckpointError {
   Io(std::io::Error),
   InvalidUtf8,
   Git { command: String, message: String },
+  InvalidCheckpointId(String),
   InvalidState(String),
   MissingMetadata(String),
   NotARepository(String),
@@ -33,6 +34,7 @@ impl fmt::Display for CheckpointError {
       CheckpointError::Git { command, message } => {
         write!(f, "Checkpoint git command failed ({command}): {message}")
       }
+      CheckpointError::InvalidCheckpointId(message) => write!(f, "{message}"),
       CheckpointError::InvalidState(message) => write!(f, "{message}"),
       CheckpointError::MissingMetadata(message) => write!(f, "{message}"),
       CheckpointError::NotARepository(message) => write!(f, "{message}"),
@@ -64,6 +66,7 @@ pub fn create_checkpoint(
   repo_path: &Path,
   checkpoint_id: &str,
 ) -> Result<CheckpointOutcome, CheckpointError> {
+  validate_checkpoint_id(checkpoint_id)?;
   ensure_repo(repo_path)?;
   if is_merge_in_progress(repo_path)? {
     return Ok(CheckpointOutcome::Skipped {
@@ -129,6 +132,7 @@ pub fn create_checkpoint(
 }
 
 pub fn restore_checkpoint(repo_path: &Path, checkpoint_id: &str) -> Result<(), CheckpointError> {
+  validate_checkpoint_id(checkpoint_id)?;
   ensure_repo(repo_path)?;
   let ref_name = format!("{CHECKPOINT_REF_PREFIX}/{checkpoint_id}");
   let commit_oid =
@@ -165,6 +169,19 @@ pub fn restore_checkpoint(repo_path: &Path, checkpoint_id: &str) -> Result<(), C
   Ok(())
 }
 
+pub fn delete_checkpoint(repo_path: &Path, checkpoint_id: &str) -> Result<(), CheckpointError> {
+  validate_checkpoint_id(checkpoint_id)?;
+  ensure_repo(repo_path)?;
+  let ref_name = format!("{CHECKPOINT_REF_PREFIX}/{checkpoint_id}");
+  run_git(
+    repo_path,
+    &["update-ref", "-d", ref_name.as_str()],
+    &[],
+    None,
+  )?;
+  Ok(())
+}
+
 fn ensure_repo(repo_path: &Path) -> Result<(), CheckpointError> {
   let output = run_git(repo_path, &["rev-parse", "--is-inside-work-tree"], &[], None)?;
   if output != "true" {
@@ -184,14 +201,31 @@ fn is_merge_in_progress(repo_path: &Path) -> Result<bool, CheckpointError> {
   )
 }
 
-fn resolve_git_dir(repo_path: &Path) -> Result<PathBuf, CheckpointError> {
-  let output = run_git(repo_path, &["rev-parse", "--git-dir"], &[], None)?;
+fn resolve_git_dir(repo_path: &Path) -> Result<PathBuf, CheckpointError> {      
+  let output = run_git(repo_path, &["rev-parse", "--git-dir"], &[], None)?;     
   let path = PathBuf::from(output);
   if path.is_absolute() {
     Ok(path)
   } else {
     Ok(repo_path.join(path))
   }
+}
+
+fn validate_checkpoint_id(checkpoint_id: &str) -> Result<(), CheckpointError> {
+  let invalid = checkpoint_id.is_empty()
+    || checkpoint_id.contains(|c: char| c.is_whitespace() || c.is_control())
+    || checkpoint_id.contains(&['/', '\\', ':', '?', '*', '[', '^', '~'][..])
+    || checkpoint_id.starts_with('.')
+    || checkpoint_id.ends_with('.')
+    || checkpoint_id.ends_with(".lock")
+    || checkpoint_id.contains("..")
+    || checkpoint_id.contains("@{");
+  if invalid {
+    return Err(CheckpointError::InvalidCheckpointId(format!(
+      "Invalid checkpoint_id: {checkpoint_id}"
+    )));
+  }
+  Ok(())
 }
 
 fn extract_meta(body: &str, key: &str) -> Result<String, CheckpointError> {
