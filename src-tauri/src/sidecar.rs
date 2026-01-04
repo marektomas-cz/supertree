@@ -1,4 +1,5 @@
 use crate::db::Database;
+use crate::path_utils;
 use crate::sessions;
 use crate::workspace;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,22 @@ type SidecarWriter = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
 const SOCKET_PATH_TIMEOUT_SECS: u64 = 30;
 const FRONTEND_RESPONSE_TIMEOUT_SECS: u64 = 120;
+const MAX_STORED_DIFF_BYTES: usize = 200_000;
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+  if value.len() <= max_bytes {
+    return value.to_string();
+  }
+  let mut end = 0;
+  for (idx, ch) in value.char_indices() {
+    let next = idx + ch.len_utf8();
+    if next > max_bytes {
+      break;
+    }
+    end = next;
+  }
+  value[..end].to_string()
+}
 
 #[derive(Clone)]
 pub struct SidecarManager {
@@ -684,6 +701,33 @@ async fn handle_sidecar_message(
         object.insert("diffStat".to_string(), Value::String(diff_stat));
       }
     }
+    if payload.agent_type == "claude" {
+      let diff_payload = GetDiffPayload {
+        session_id: payload.id.clone(),
+        file: None,
+        stat: Some(false),
+      };
+      match get_diff_response(db, &diff_payload).await {
+        Ok(value) => {
+          if let Some(diff) = value.get("diff").and_then(|diff| diff.as_str()) {
+            let trimmed = diff.trim();
+            if !trimmed.is_empty() {
+              let mut stored = trimmed.to_string();
+              if stored.len() > MAX_STORED_DIFF_BYTES {
+                stored = truncate_utf8(trimmed, MAX_STORED_DIFF_BYTES);
+                stored.push_str("\n...[truncated]");
+              }
+              if let Some(object) = metadata.as_object_mut() {
+                object.insert("diff".to_string(), Value::String(stored));       
+              }
+            }
+          }
+        }
+        Err(err) => {
+          eprintln!("[sidecar] diff capture error: {err}");
+        }
+      }
+    }
   }
   let metadata_str = metadata.to_string();
 
@@ -816,10 +860,10 @@ async fn get_diff_response(db: &Database, payload: &GetDiffPayload) -> Result<Va
         let relative = candidate
           .strip_prefix(&workspace_path)
           .map_err(|_| "File is outside workspace".to_string())?;
-        let normalized = normalize_relative_path(relative)?;
+        let normalized = path_utils::normalize_relative_path(relative)?;
         command.arg("--").arg(normalized);
       } else {
-        let normalized = normalize_relative_path(&candidate)?;
+        let normalized = path_utils::normalize_relative_path(&candidate)?;
         command.arg("--").arg(normalized);
       }
     }
@@ -859,26 +903,6 @@ async fn get_workspace_diff_stat(db: &Database, session_id: &str) -> Option<Stri
       None
     }
   }
-}
-
-fn normalize_relative_path(path: &std::path::Path) -> Result<PathBuf, String> {
-  use std::path::Component;
-  let mut normalized = PathBuf::new();
-  for component in path.components() {
-    match component {
-      Component::CurDir => {}
-      Component::Normal(value) => normalized.push(value),
-      Component::ParentDir => {
-        if !normalized.pop() {
-          return Err("File is outside workspace".to_string());
-        }
-      }
-      Component::RootDir | Component::Prefix(_) => {
-        return Err("Path must be workspace-relative".to_string());
-      }
-    }
-  }
-  Ok(normalized)
 }
 
 fn id_to_key(id: &Value) -> String {

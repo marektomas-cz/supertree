@@ -75,6 +75,30 @@ type TerminalSession = {
   label: string;
 };
 
+type GitStatusEntry = {
+  path: string;
+  indexStatus: string;
+  worktreeStatus: string;
+  additions: number | null;
+  deletions: number | null;
+};
+
+type SettingsEntry = {
+  key: string;
+  value: string;
+};
+
+type WorkspaceDiffResponse = {
+  diff: string;
+};
+
+type FileTreeNode = {
+  name: string;
+  path: string;
+  children?: FileTreeNode[];
+  isFile: boolean;
+};
+
 const STORAGE_KEYS = {
   leftVisible: 'supertree.leftSidebarVisible',
   rightVisible: 'supertree.rightSidebarVisible',
@@ -84,6 +108,10 @@ const STORAGE_KEYS = {
   openSessions: 'supertree.openSessionsByWorkspace',
   activeSessions: 'supertree.activeSessionsByWorkspace',
 };
+
+const REVIEW_DIFF_MAX_CHARS = 12_000;
+const REVIEW_DIFF_HEAD_CHARS = 7_000;
+const REVIEW_DIFF_TAIL_CHARS = 3_000;
 
 const readBoolean = (key: string, fallback: boolean) => {
   if (typeof window === 'undefined') {
@@ -121,6 +149,96 @@ const readJson = <T,>(key: string, fallback: T): T => {
   } catch {
     return fallback;
   }
+};
+
+const truncateReviewDiff = (diff: string) => {
+  if (diff.length <= REVIEW_DIFF_MAX_CHARS) {
+    return { text: diff, truncated: false };
+  }
+  const headSection = diff.slice(0, REVIEW_DIFF_HEAD_CHARS);
+  const headBoundary = Math.max(
+    headSection.lastIndexOf('\ndiff --git'),
+    headSection.lastIndexOf('\n@@'),
+  );
+  const head = headBoundary > 0 ? headSection.slice(0, headBoundary) : headSection;
+
+  const tailSection = diff.slice(-REVIEW_DIFF_TAIL_CHARS);
+  const tailBoundaryGit = tailSection.indexOf('\ndiff --git');
+  const tailBoundaryHunk = tailSection.indexOf('\n@@');
+  let tailBoundary = -1;
+  if (tailBoundaryGit >= 0 && tailBoundaryHunk >= 0) {
+    tailBoundary = Math.min(tailBoundaryGit, tailBoundaryHunk);
+  } else {
+    tailBoundary = tailBoundaryGit >= 0 ? tailBoundaryGit : tailBoundaryHunk;
+  }
+  const tail = tailBoundary > 0 ? tailSection.slice(tailBoundary) : tailSection;
+  return { text: `${head}\n...[truncated]...\n${tail}`, truncated: true };
+};
+
+const buildFileTree = (files: string[]): FileTreeNode[] => {
+  type FileTreeMapNode = {
+    name: string;
+    path: string;
+    children: Record<string, FileTreeMapNode>;
+    isFile: boolean;
+  };
+  const root: Record<string, FileTreeMapNode> = {};
+  for (const file of files) {
+    const parts = file.split('/').filter(Boolean);
+    let current = root;
+    let currentPath = '';
+    parts.forEach((part, index) => {
+      currentPath = currentPath ? `${currentPath}/${part}` : part;
+      if (!current[part]) {
+        current[part] = {
+          name: part,
+          path: currentPath,
+          children: {},
+          isFile: index === parts.length - 1,
+        };
+      }
+      if (index < parts.length - 1) {
+        current[part].isFile = false;
+      } else if (Object.keys(current[part].children).length === 0) {
+        current[part].isFile = true;
+      }
+      current = current[part].children;
+    });
+  }
+
+  const toArray = (nodeMap: Record<string, FileTreeMapNode>): FileTreeNode[] => {
+    return Object.values(nodeMap)
+      .map((node) => {
+        const children = Object.keys(node.children).length > 0 ? toArray(node.children) : undefined;
+        return { name: node.name, path: node.path, children, isFile: node.isFile };
+      })
+      .sort((a, b) => {
+        if (a.isFile !== b.isFile) {
+          return a.isFile ? 1 : -1;
+        }
+        return a.name.localeCompare(b.name);
+      });
+  };
+
+  return toArray(root);
+};
+
+const GIT_STATUS_LABELS: Record<string, string> = {
+  '?': 'Untracked',
+  A: 'Added',
+  D: 'Deleted',
+  R: 'Renamed',
+  C: 'Copied',
+  M: 'Modified',
+};
+
+const formatGitStatus = (entry: GitStatusEntry) => {
+  const index = entry.indexStatus.trim();
+  const worktree = entry.worktreeStatus.trim();
+  if (index === '?' && worktree === '?') {
+    return GIT_STATUS_LABELS['?'];
+  }
+  return GIT_STATUS_LABELS[index] ?? GIT_STATUS_LABELS[worktree] ?? 'Updated';
 };
 
 const writeJson = (key: string, value: unknown) => {
@@ -340,20 +458,6 @@ const renderMarkdownContent = (
   });
 };
 
-const DIFF_PLACEHOLDER = `diff --git a/src/main.tsx b/src/main.tsx
-index 5b8c3d2..c19b2e1 100644
---- a/src/main.tsx
-+++ b/src/main.tsx
-@@ -12,6 +12,8 @@ export function Main() {
-   return (
-     <section className="app">
-+      <h1>Workspace changes</h1>
-+      <p>Preview shows unified diff output.</p>
-       <Composer />
-     </section>
-   );
- }`;
-
 const RUN_OUTPUT_LIMIT = 400;
 
 /**
@@ -459,9 +563,35 @@ export default function AppShell() {
   const [planModeBySession, setPlanModeBySession] = useState<
     Record<string, boolean>
   >({});
-  const [permissionModeBySession, setPermissionModeBySession] = useState<
+  const [permissionModeBySession, setPermissionModeBySession] = useState<       
     Record<string, string>
   >({});
+  const [gitStatusByWorkspace, setGitStatusByWorkspace] = useState<
+    Record<string, GitStatusEntry[]>
+  >({});
+  const [gitStatusErrorByWorkspace, setGitStatusErrorByWorkspace] = useState<
+    Record<string, string | null>
+  >({});
+  const [gitStatusLoadingByWorkspace, setGitStatusLoadingByWorkspace] = useState<
+    Record<string, boolean>
+  >({});
+  const [workspaceDiffByWorkspace, setWorkspaceDiffByWorkspace] = useState<
+    Record<string, string>
+  >({});
+  const [workspaceDiffErrorByWorkspace, setWorkspaceDiffErrorByWorkspace] =
+    useState<Record<string, string | null>>({});
+  const [diffLoadingByWorkspace, setDiffLoadingByWorkspace] = useState<
+    Record<string, boolean>
+  >({});
+  const [selectedDiffPathByWorkspace, setSelectedDiffPathByWorkspace] = useState<
+    Record<string, string | null>
+  >({});
+  const [diffHistoryExpandedByMessage, setDiffHistoryExpandedByMessage] =
+    useState<Record<string, boolean>>({});
+  const [reviewModel, setReviewModel] = useState<string | null>(null);
+  const [reviewThinkingLevel, setReviewThinkingLevel] = useState<string | null>(
+    null,
+  );
   const [composerValue, setComposerValue] = useState('');
   const [composerDragActive, setComposerDragActive] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -673,6 +803,34 @@ export default function AppShell() {
     }
     return filePreviewByWorkspace[activeWorkspaceId] ?? null;
   }, [activeWorkspaceId, filePreviewByWorkspace]);
+  const activeGitStatus = useMemo(() => {
+    if (!activeWorkspaceId) {
+      return [];
+    }
+    return gitStatusByWorkspace[activeWorkspaceId] ?? [];
+  }, [activeWorkspaceId, gitStatusByWorkspace]);
+  const activeGitStatusError = activeWorkspaceId
+    ? gitStatusErrorByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const activeGitStatusLoading = activeWorkspaceId
+    ? gitStatusLoadingByWorkspace[activeWorkspaceId] ?? false
+    : false;
+  const activeWorkspaceDiff = activeWorkspaceId
+    ? workspaceDiffByWorkspace[activeWorkspaceId] ?? ''
+    : '';
+  const activeWorkspaceDiffError = activeWorkspaceId
+    ? workspaceDiffErrorByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const activeWorkspaceDiffLoading = activeWorkspaceId
+    ? diffLoadingByWorkspace[activeWorkspaceId] ?? false
+    : false;
+  const selectedDiffPath = activeWorkspaceId
+    ? selectedDiffPathByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const workspaceFileTree = useMemo(
+    () => buildFileTree(workspaceFiles),
+    [workspaceFiles],
+  );
   const activeRunStatus = activeWorkspaceId
     ? runStatusByWorkspace[activeWorkspaceId] ?? 'idle'
     : 'idle';
@@ -881,6 +1039,72 @@ export default function AppShell() {
     }
   }, []);
 
+  const loadGitStatus = useCallback(async (workspaceId: string) => {
+    setGitStatusErrorByWorkspace((prev) => ({ ...prev, [workspaceId]: null }));
+    setGitStatusLoadingByWorkspace((prev) => ({ ...prev, [workspaceId]: true }));
+    try {
+      const data = await invoke<GitStatusEntry[]>('getWorkspaceGitStatus', {
+        workspaceId,
+      });
+      setGitStatusByWorkspace((prev) => ({ ...prev, [workspaceId]: data }));
+    } catch (err) {
+      setGitStatusErrorByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: String(err),
+      }));
+      setGitStatusByWorkspace((prev) => ({ ...prev, [workspaceId]: [] }));
+    } finally {
+      setGitStatusLoadingByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: false,
+      }));
+    }
+  }, []);
+
+  const loadWorkspaceDiff = useCallback(
+    async (workspaceId: string, path?: string | null) => {
+      setWorkspaceDiffErrorByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: null,
+      }));
+      setDiffLoadingByWorkspace((prev) => ({ ...prev, [workspaceId]: true }));
+      try {
+        const response = await invoke<WorkspaceDiffResponse>('getWorkspaceDiff', {
+          workspaceId,
+          path: path ?? null,
+          stat: false,
+        });
+        setWorkspaceDiffByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: response.diff,
+        }));
+      } catch (err) {
+        setWorkspaceDiffErrorByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: String(err),
+        }));
+        setWorkspaceDiffByWorkspace((prev) => ({ ...prev, [workspaceId]: '' }));
+      } finally {
+        setDiffLoadingByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: false,
+        }));
+      }
+    },
+    [],
+  );
+
+  const loadReviewSettings = useCallback(async () => {
+    try {
+      const entries = await invoke<SettingsEntry[]>('listSettings');
+      const byKey = new Map(entries.map((entry) => [entry.key, entry.value]));  
+      setReviewModel(byKey.get('review_model') ?? null);
+      setReviewThinkingLevel(byKey.get('review_thinking_level') ?? null);       
+    } catch (err) {
+      console.warn('Failed to load review settings:', err);
+    }
+  }, []);
+
   const loadSessionMessages = useCallback(async (sessionId: string) => {
     try {
       const data = await invoke<SessionMessageRecord[]>('listSessionMessages', {
@@ -964,6 +1188,10 @@ export default function AppShell() {
       active = false;
     };
   }, [loadSessions]);
+
+  useEffect(() => {
+    void loadReviewSettings();
+  }, [loadReviewSettings]);
 
   useEffect(() => {
     if (!activeSessionId) {
@@ -1662,6 +1890,77 @@ export default function AppShell() {
     permissionModeBySession,
   ]);
 
+  const handleReviewChanges = useCallback(async () => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    setSendError(null);
+    setActiveView('workspace');
+    const modelId = reviewModel ?? getDefaultModel('codex');
+    const agentType =
+      (modelId ? MODEL_LOOKUP.agentById.get(modelId) : null) ?? 'codex';
+    let session: SessionRecord;
+    try {
+      session = await createSessionForWorkspace(activeWorkspaceId, agentType, modelId);
+    } catch {
+      return;
+    }
+    const permissionMode =
+      agentType === 'claude' ? permissionModeBySession[session.id] ?? 'default' : undefined;
+    let diffText = '';
+    let diffTruncated = false;
+    try {
+      const response = await invoke<WorkspaceDiffResponse>('getWorkspaceDiff', {
+        workspaceId: activeWorkspaceId,
+        path: null,
+        stat: false,
+      });
+      const trimmed = response.diff.trim();
+      const truncated = truncateReviewDiff(trimmed);
+      diffText = truncated.text;
+      diffTruncated = truncated.truncated;
+    } catch (err) {
+      setSendError(String(err));
+      return;
+    }
+    const thinking = reviewThinkingLevel ?? 'medium';
+    const promptLines = [
+      'Review the following git diff and leave concise, actionable feedback.',
+      `Thinking level: ${thinking}.`,
+      'Output format: Summary, Issues (if any), Suggestions.',
+      diffTruncated ? 'Diff truncated to fit the review prompt.' : null,
+      diffText ? '```diff\n' + diffText + '\n```' : 'No changes detected in the workspace.',
+    ].filter((line): line is string => Boolean(line));
+    const prompt = promptLines.join('\n');
+    try {
+      setSessionErrors((prev) => ({ ...prev, [session.id]: null }));
+      const userMessage = await invoke<SessionMessageRecord>('sendSessionMessage', {
+        sessionId: session.id,
+        prompt,
+        permissionMode,
+      });
+      const normalized = normalizeSessionMessage(userMessage);
+      setMessagesBySession((prev) => {
+        const list = prev[session.id] ?? [];
+        return { ...prev, [session.id]: [...list, normalized] };
+      });
+      setSessionStatuses((prev) => ({ ...prev, [session.id]: 'running' }));
+      setActiveTabByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: 'session',
+      }));
+    } catch (err) {
+      setSendError(String(err));
+      setSessionErrors((prev) => ({ ...prev, [session.id]: String(err) }));
+    }
+  }, [
+    activeWorkspaceId,
+    createSessionForWorkspace,
+    permissionModeBySession,
+    reviewModel,
+    reviewThinkingLevel,
+  ]);
+
   const handleCancelSession = useCallback(async () => {
     if (!activeSession) {
       return;
@@ -2233,6 +2532,36 @@ export default function AppShell() {
     if (!activeWorkspaceId) {
       return;
     }
+    setSelectedDiffPathByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: prev[activeWorkspaceId] ?? null,
+    }));
+    const hasGitStatus = Object.prototype.hasOwnProperty.call(
+      gitStatusByWorkspace,
+      activeWorkspaceId,
+    );
+    if (!hasGitStatus) {
+      loadGitStatus(activeWorkspaceId);
+    }
+    const hasWorkspaceDiff = Object.prototype.hasOwnProperty.call(
+      workspaceDiffByWorkspace,
+      activeWorkspaceId,
+    );
+    if (!hasWorkspaceDiff) {
+      loadWorkspaceDiff(activeWorkspaceId, null);
+    }
+  }, [
+    activeWorkspaceId,
+    gitStatusByWorkspace,
+    loadGitStatus,
+    loadWorkspaceDiff,
+    workspaceDiffByWorkspace,
+  ]);
+
+  useEffect(() => {
+    if (!activeWorkspaceId) {
+      return;
+    }
     const openIds = openSessionIdsByWorkspace[activeWorkspaceId] ?? [];
     const activeId = activeSessionByWorkspace[activeWorkspaceId] ?? null;
     if (openIds.length === 0) {
@@ -2277,6 +2606,78 @@ export default function AppShell() {
       }
     },
     [],
+  );
+
+  const handleSelectDiffFile = useCallback(
+    async (workspaceId: string, path: string) => {
+      setActiveView('workspace');
+      setActiveTabByWorkspace((prev) => ({ ...prev, [workspaceId]: 'changes' }));
+      setSelectedDiffPathByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: path,
+      }));
+      await loadWorkspaceDiff(workspaceId, path);
+    },
+    [loadWorkspaceDiff],
+  );
+
+  const handleClearDiffSelection = useCallback(() => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    setSelectedDiffPathByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: null,
+    }));
+    void loadWorkspaceDiff(activeWorkspaceId, null);
+  }, [activeWorkspaceId, loadWorkspaceDiff]);
+
+  const handleRefreshGitPanel = useCallback(() => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    loadGitStatus(activeWorkspaceId);
+    const selected = selectedDiffPathByWorkspace[activeWorkspaceId] ?? null;
+    loadWorkspaceDiff(activeWorkspaceId, selected);
+  }, [activeWorkspaceId, loadGitStatus, loadWorkspaceDiff, selectedDiffPathByWorkspace]);
+
+  const renderFileTree = useCallback(
+    (nodes: FileTreeNode[], depth = 0) => {
+      return nodes.map((node) => {
+        if (node.isFile) {
+          return (
+            <button
+              key={node.path}
+              type="button"
+              onClick={() => {
+                if (!activeWorkspaceId) {
+                  return;
+                }
+                void handleOpenFile(activeWorkspaceId, node.path);
+              }}
+              style={{ paddingLeft: depth * 12 }}
+              className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs text-slate-300 hover:bg-slate-900 hover:text-slate-100"
+            >
+              <span className="truncate">{node.name}</span>
+            </button>
+          );
+        }
+        return (
+          <div key={node.path}>
+            <div
+              style={{ paddingLeft: depth * 12 }}
+              className="flex items-center gap-2 px-2 py-1 text-xs font-semibold text-slate-400"
+            >
+              <span className="truncate">{node.name}</span>
+            </div>
+            {node.children ? (
+              <div className="space-y-1">{renderFileTree(node.children, depth + 1)}</div>
+            ) : null}
+          </div>
+        );
+      });
+    },
+    [activeWorkspaceId, handleOpenFile],
   );
 
   const handleRunScript = useCallback(async () => {
@@ -3332,6 +3733,16 @@ export default function AppShell() {
               {filePreviewError}
             </div>
           ) : null}
+          {activeGitStatusError ? (
+            <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+              {activeGitStatusError}
+            </div>
+          ) : null}
+          {activeWorkspaceDiffError ? (
+            <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+              {activeWorkspaceDiffError}
+            </div>
+          ) : null}
 
           {activeView === 'settings' ? (
             <SettingsPage />
@@ -3377,18 +3788,60 @@ export default function AppShell() {
                 </div>
 
                 {activeTab === 'changes' ? (
-                  <div className="grid gap-6 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+                  <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)_minmax(0,1fr)]">
                     <div className="rounded-lg border border-slate-800 bg-slate-950/60">
                       <div className="border-b border-slate-800 px-4 py-3">
                         <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
-                          Diff preview
+                          File tree
                         </div>
                         <div className="mt-1 text-xs text-slate-500">
-                          Unified diff placeholder
+                          {workspaceFiles.length > 0
+                            ? `${workspaceFiles.length} files`
+                            : 'No files loaded.'}
+                        </div>
+                      </div>
+                      <div className="max-h-[360px] overflow-auto px-3 py-3 text-xs">
+                        {workspaceFileTree.length === 0 ? (
+                          <div className="text-sm text-slate-500">
+                            No files loaded.
+                          </div>
+                        ) : (
+                          <div className="space-y-1">
+                            {renderFileTree(workspaceFileTree)}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-slate-800 bg-slate-950/60">
+                      <div className="border-b border-slate-800 px-4 py-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                              Diff preview
+                            </div>
+                            <div className="mt-1 text-xs text-slate-500">
+                              {selectedDiffPath
+                                ? `Diff for ${selectedDiffPath}`
+                                : 'Unified diff for all changes'}
+                            </div>
+                          </div>
+                          {selectedDiffPath ? (
+                            <button
+                              type="button"
+                              onClick={handleClearDiffSelection}
+                              className="rounded-md border border-slate-800 px-2 py-1 text-[11px] text-slate-400 transition hover:bg-slate-900 hover:text-slate-100"
+                            >
+                              Show all
+                            </button>
+                          ) : null}
                         </div>
                       </div>
                       <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap px-4 py-3 text-xs text-slate-200">
-                        {DIFF_PLACEHOLDER}
+                        {activeWorkspaceDiffLoading
+                          ? 'Loading diff...'
+                          : activeWorkspaceDiff.trim()
+                            ? activeWorkspaceDiff
+                            : 'No changes detected.'}
                       </pre>
                     </div>
                     <div className="rounded-lg border border-slate-800 bg-slate-950/60">
@@ -3530,6 +3983,17 @@ export default function AppShell() {
                               : null;
                           const diffStat =
                             typeof diffStatRaw === 'string' ? diffStatRaw : null;
+                          const diffRaw =
+                            message.metadata &&
+                            typeof message.metadata === 'object' &&
+                            'diff' in message.metadata
+                              ? (message.metadata as Record<string, unknown>)['diff']
+                              : null;
+                          const diffText =
+                            typeof diffRaw === 'string' ? diffRaw : null;
+                          const diffExpanded = diffText
+                            ? diffHistoryExpandedByMessage[message.id] ?? false
+                            : false;
                           const diffLines = diffStat
                             ? diffStat
                                 .trim()
@@ -3624,6 +4088,36 @@ export default function AppShell() {
                                       {diffFiles.join('\n')}
                                     </pre>
                                   ) : null}
+                                </div>
+                              ) : null}
+                              {message.role === 'assistant' && diffText ? (
+                                <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-400">
+                                  <div className="flex items-center justify-between">
+                                    <div className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
+                                      Turn diff
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setDiffHistoryExpandedByMessage((prev) => ({
+                                          ...prev,
+                                          [message.id]: !diffExpanded,
+                                        }))
+                                      }
+                                      className="rounded-md border border-slate-800 px-2 py-1 text-[10px] uppercase tracking-widest text-slate-500 transition hover:bg-slate-900 hover:text-slate-100"
+                                    >
+                                      {diffExpanded ? 'Hide' : 'Show'}
+                                    </button>
+                                  </div>
+                                  {diffExpanded ? (
+                                    <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap text-[11px] text-slate-300">
+                                      {diffText}
+                                    </pre>
+                                  ) : (
+                                    <div className="mt-2 text-[11px] text-slate-500">
+                                      Diff captured for this turn.
+                                    </div>
+                                  )}
                                 </div>
                               ) : null}
                             </div>
@@ -3892,9 +4386,24 @@ export default function AppShell() {
                 </div>
               </div>
               <div className="mt-3 flex gap-2">
-                <Button size="sm">Create PR</Button>
-                <Button size="sm" variant="outline">
+                <Button size="sm" disabled={!activeWorkspaceId}>
+                  Create PR
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={!activeWorkspaceId}
+                  onClick={handleReviewChanges}
+                >
                   Review
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={!activeWorkspaceId}
+                  onClick={handleRefreshGitPanel}
+                >
+                  Refresh
                 </Button>
               </div>
               <div className="mt-4 flex gap-2">
@@ -3925,7 +4434,48 @@ export default function AppShell() {
 
             <div className="flex-1 overflow-auto p-4">
               {gitPanelTab === 'changes' ? (
-                <div className="text-sm text-slate-500">No changes yet.</div>
+                !activeWorkspaceId ? (
+                  <div className="text-sm text-slate-500">
+                    Select a workspace to see changes.
+                  </div>
+                ) : activeGitStatusLoading ? (
+                  <div className="text-sm text-slate-500">Loading changes...</div>
+                ) : activeGitStatus.length === 0 ? (
+                  <div className="text-sm text-slate-500">No changes yet.</div>
+                ) : (
+                  <div className="space-y-2">
+                    {activeGitStatus.map((entry) => {
+                      const additions =
+                        entry.additions === null ? '—' : `+${entry.additions}`;
+                      const deletions =
+                        entry.deletions === null ? '—' : `-${entry.deletions}`;
+                      return (
+                        <button
+                          key={entry.path}
+                          type="button"
+                          onClick={() => {
+                            if (!activeWorkspaceId) {
+                              return;
+                            }
+                            void handleSelectDiffFile(activeWorkspaceId, entry.path);
+                          }}
+                          className="flex w-full items-center justify-between gap-2 rounded-md border border-slate-800 px-2 py-2 text-left text-xs text-slate-300 hover:bg-slate-900 hover:text-slate-100"
+                        >
+                          <div className="min-w-0">
+                            <div className="truncate">{entry.path}</div>
+                            <div className="mt-1 text-[10px] uppercase tracking-widest text-slate-500">
+                              {formatGitStatus(entry)}
+                            </div>
+                          </div>
+                          <div className="flex shrink-0 items-center gap-2 text-[10px] text-slate-400">
+                            <span className="text-emerald-400">{additions}</span>
+                            <span className="text-rose-400">{deletions}</span>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )
               ) : !activeWorkspaceId ? (
                 <div className="text-sm text-slate-500">
                   Select a workspace to browse files.
