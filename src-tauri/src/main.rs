@@ -637,6 +637,7 @@ fn should_skip_dir(path: &Path) -> bool {
 fn list_workspace_files(root: &Path) -> Result<Vec<String>, String> {
   let mut results = Vec::new();
   let mut stack = vec![root.to_path_buf()];
+  let mut limit_reached = false;
   while let Some(dir) = stack.pop() {
     let entries = fs::read_dir(&dir).map_err(|err| err.to_string())?;
     for entry in entries {
@@ -660,11 +661,18 @@ fn list_workspace_files(root: &Path) -> Result<Vec<String>, String> {
         .replace('\\', "/");
       results.push(relative);
       if results.len() >= MAX_WORKSPACE_FILES {
-        return Ok(results);
+        limit_reached = true;
+        break;
       }
+    }
+    if limit_reached {
+      break;
     }
   }
   results.sort();
+  if results.len() > MAX_WORKSPACE_FILES {
+    results.truncate(MAX_WORKSPACE_FILES);
+  }
   Ok(results)
 }
 

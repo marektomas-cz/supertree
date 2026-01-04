@@ -153,6 +153,7 @@ export default function AppShell() {
   >({});
   const [rightPanelTab, setRightPanelTab] = useState<'run' | 'terminal'>('run');
   const [gitPanelTab, setGitPanelTab] = useState<'changes' | 'files'>('changes');
+  const [fileListVisibleCount, setFileListVisibleCount] = useState(20);
 
   const selectedRepo = useMemo(
     () => repos.find((repo) => repo.id === selectedRepoId) ?? null,
@@ -205,6 +206,8 @@ export default function AppShell() {
     }
     return filePreviewByWorkspace[activeWorkspaceId] ?? null;
   }, [activeWorkspaceId, filePreviewByWorkspace]);
+  const visibleFileCount = Math.min(fileListVisibleCount, workspaceFiles.length);
+  const fileListIsTruncated = workspaceFiles.length > visibleFileCount;
   const showLeftSidebar = leftSidebarVisible && !zenMode;
   const showRightSidebar = rightSidebarVisible && !zenMode;
   const isMac = useMemo(
@@ -697,6 +700,10 @@ export default function AppShell() {
       }));
     }
   }, [activeWorkspaceId, filesByWorkspace, loadWorkspaceFiles]);
+
+  useEffect(() => {
+    setFileListVisibleCount(20);
+  }, [activeWorkspaceId]);
 
   const handleOpenFile = useCallback(
     async (workspaceId: string, path: string) => {
@@ -1616,22 +1623,55 @@ export default function AppShell() {
                 <div className="text-sm text-slate-500">No files loaded.</div>
               ) : (
                 <div className="space-y-2">
-                  {workspaceFiles.slice(0, 20).map((file) => (
-                    <button
-                      key={file}
-                      type="button"
-                      onClick={() => {
-                        if (!activeWorkspaceId) {
-                          return;
-                        }
-                        void handleOpenFile(activeWorkspaceId, file);
-                        setActiveView('workspace');
-                      }}
-                      className="w-full rounded-md px-2 py-1 text-left text-xs text-slate-300 hover:bg-slate-900 hover:text-slate-100"
-                    >
-                      {file}
-                    </button>
-                  ))}
+                  <div className="flex items-center justify-between text-[11px] text-slate-500">
+                    <span>
+                      Showing {visibleFileCount} of {workspaceFiles.length} files
+                    </span>
+                    {fileListIsTruncated ? (
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          aria-label="Show more files"
+                          onClick={() =>
+                            setFileListVisibleCount((prev) =>
+                              Math.min(prev + 20, workspaceFiles.length),
+                            )
+                          }
+                          className="rounded-md border border-slate-800 px-2 py-1 text-[11px] text-slate-400 transition hover:bg-slate-900 hover:text-slate-100"
+                        >
+                          Show more
+                        </button>
+                        <button
+                          type="button"
+                          aria-label="Show all files"
+                          onClick={() =>
+                            setFileListVisibleCount(workspaceFiles.length)
+                          }
+                          className="rounded-md border border-slate-800 px-2 py-1 text-[11px] text-slate-400 transition hover:bg-slate-900 hover:text-slate-100"
+                        >
+                          Show all
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="space-y-2">
+                    {workspaceFiles.slice(0, visibleFileCount).map((file) => (
+                      <button
+                        key={file}
+                        type="button"
+                        onClick={() => {
+                          if (!activeWorkspaceId) {
+                            return;
+                          }
+                          void handleOpenFile(activeWorkspaceId, file);
+                          setActiveView('workspace');
+                        }}
+                        className="w-full rounded-md px-2 py-1 text-left text-xs text-slate-300 hover:bg-slate-900 hover:text-slate-100"
+                      >
+                        {file}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
             </div>
