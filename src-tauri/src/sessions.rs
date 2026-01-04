@@ -373,7 +373,9 @@ pub async fn get_session_message_checkpoint(
   let row = sqlx::query_as::<_, SessionMessageCheckpoint>(
     "SELECT checkpoint_id, role
      FROM session_messages
-     WHERE session_id = ? AND turn_id = ?",
+     WHERE session_id = ? AND turn_id = ?
+     ORDER BY created_at ASC
+     LIMIT 1",
   )
   .bind(session_id)
   .bind(turn_id)
@@ -403,6 +405,45 @@ pub async fn delete_session_messages_from_turn(
     .bind(turn_id)
     .execute(&mut *tx)
     .await?;
+  tx.commit().await?;
+  Ok(())
+}
+
+pub async fn reset_session_to_turn(
+  pool: &SqlitePool,
+  session_id: &str,
+  turn_id: i64,
+) -> Result<(), DbError> {
+  let mut tx = pool.begin().await?;
+  sqlx::query(
+    "DELETE FROM attachments
+     WHERE session_message_id IN (
+       SELECT id FROM session_messages WHERE session_id = ? AND turn_id >= ?
+     )",
+  )
+  .bind(session_id)
+  .bind(turn_id)
+  .execute(&mut *tx)
+  .await?;
+  sqlx::query("DELETE FROM session_messages WHERE session_id = ? AND turn_id >= ?")
+    .bind(session_id)
+    .bind(turn_id)
+    .execute(&mut *tx)
+    .await?;
+  let result = sqlx::query(
+    "UPDATE sessions
+     SET claude_session_id = NULL,
+         codex_session_id = NULL,
+         status = 'idle',
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?",
+  )
+  .bind(session_id)
+  .execute(&mut *tx)
+  .await?;
+  if result.rows_affected() == 0 {
+    return Err(DbError::NotFound(format!("Session not found: {session_id}")));
+  }
   tx.commit().await?;
   Ok(())
 }

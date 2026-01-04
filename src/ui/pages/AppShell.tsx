@@ -778,12 +778,20 @@ export default function AppShell() {
     }
     return sessionsByWorkspace[activeWorkspaceId] ?? [];
   }, [activeWorkspaceId, sessionsByWorkspace]);
-  const hasOtherRunningSessions = useMemo(() => {
+  const hasAnyRunningSessions = useMemo(() => {
+    if (activeSessionStatus === 'running') {
+      return true;
+    }
     return activeWorkspaceSessions.some((session) => {
       const status = sessionStatuses[session.id] ?? session.status ?? 'idle';
       return status === 'running' && session.id !== activeSessionId;
     });
-  }, [activeWorkspaceSessions, activeSessionId, sessionStatuses]);
+  }, [
+    activeSessionId,
+    activeSessionStatus,
+    activeWorkspaceSessions,
+    sessionStatuses,
+  ]);
   const activeSessionMessages = useMemo(() => {
     if (!activeSessionId) {
       return [];
@@ -2496,16 +2504,16 @@ export default function AppShell() {
       if (!activeSession || !activeWorkspaceId || turnId === undefined) {
         return;
       }
-      if (hasOtherRunningSessions) {
+      if (hasAnyRunningSessions) {
         setSessionErrors((prev) => ({
           ...prev,
           [activeSession.id]:
-            'Stop other running sessions in this workspace before resetting.',
+            'Stop running sessions in this workspace before resetting.',
         }));
         return;
       }
       const confirmed = globalThis.confirm?.(
-        'Reset to this point? This will discard all messages and code changes after this turn.',
+        'Reset to this point? This will discard all messages and code changes after this turn and delete untracked files created after this point (gitignored files are preserved).',
       );
       if (!confirmed) {
         return;
@@ -2513,6 +2521,7 @@ export default function AppShell() {
       setSendError(null);
       setSessionErrors((prev) => ({ ...prev, [activeSession.id]: null }));
       setResettingTurnId(turnId);
+      setSessionStatuses((prev) => ({ ...prev, [activeSession.id]: 'running' }));
       try {
         await invoke('resetSessionToTurn', {
           sessionId: activeSession.id,
@@ -2524,7 +2533,6 @@ export default function AppShell() {
         await loadGitStatus(activeWorkspaceId);
         const selectedDiff = selectedDiffPathByWorkspace[activeWorkspaceId] ?? null;
         await loadWorkspaceDiff(activeWorkspaceId, selectedDiff);
-        setSessionStatuses((prev) => ({ ...prev, [activeSession.id]: 'idle' }));
         setPlanModeBySession((prev) => ({ ...prev, [activeSession.id]: false }));
       } catch (err) {
         setSessionErrors((prev) => ({
@@ -2532,13 +2540,14 @@ export default function AppShell() {
           [activeSession.id]: String(err),
         }));
       } finally {
+        setSessionStatuses((prev) => ({ ...prev, [activeSession.id]: 'idle' }));
         setResettingTurnId(null);
       }
     },
     [
       activeSession,
       activeWorkspaceId,
-      hasOtherRunningSessions,
+      hasAnyRunningSessions,
       loadGitStatus,
       loadSessionAttachments,
       loadSessionMessages,
@@ -4613,7 +4622,7 @@ export default function AppShell() {
                             message.turnId !== undefined &&
                             Boolean(message.checkpointId) &&
                             activeSession?.agentType === 'claude' &&
-                            !hasOtherRunningSessions;
+                            !hasAnyRunningSessions;
                           const isResetting = resettingTurnId === message.turnId;
                           return (
                             <div

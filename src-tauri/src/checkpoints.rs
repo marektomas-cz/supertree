@@ -19,19 +19,23 @@ pub enum CheckpointError {
   Io(std::io::Error),
   InvalidUtf8,
   Git { command: String, message: String },
+  InvalidState(String),
   MissingMetadata(String),
+  NotARepository(String),
   Time(String),
 }
 
 impl fmt::Display for CheckpointError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      CheckpointError::Io(err) => write!(f, "Checkpoint IO error: {err}"),
+      CheckpointError::Io(err) => write!(f, "Checkpoint IO error: {err}"),      
       CheckpointError::InvalidUtf8 => write!(f, "Checkpoint git output was not valid UTF-8"),
       CheckpointError::Git { command, message } => {
         write!(f, "Checkpoint git command failed ({command}): {message}")
       }
+      CheckpointError::InvalidState(message) => write!(f, "{message}"),
       CheckpointError::MissingMetadata(message) => write!(f, "{message}"),
+      CheckpointError::NotARepository(message) => write!(f, "{message}"),
       CheckpointError::Time(message) => write!(f, "{message}"),
     }
   }
@@ -136,7 +140,7 @@ pub fn restore_checkpoint(repo_path: &Path, checkpoint_id: &str) -> Result<(), C
   let worktree_tree = extract_meta(&commit_body, "worktree-tree")?;
 
   if head_oid == ZERO_OID {
-    return Err(CheckpointError::MissingMetadata(
+    return Err(CheckpointError::InvalidState(
       "Checkpoint saved with unborn HEAD and cannot be restored".to_string(),
     ));
   }
@@ -148,6 +152,8 @@ pub fn restore_checkpoint(repo_path: &Path, checkpoint_id: &str) -> Result<(), C
     &[],
     None,
   )?;
+  // Restores remove untracked files not present in the checkpoint snapshot.
+  // Callers should ensure explicit user confirmation before invoking restore.
   run_git(repo_path, &["clean", "-fd"], &[], None)?;
   run_git(
     repo_path,
@@ -162,7 +168,7 @@ pub fn restore_checkpoint(repo_path: &Path, checkpoint_id: &str) -> Result<(), C
 fn ensure_repo(repo_path: &Path) -> Result<(), CheckpointError> {
   let output = run_git(repo_path, &["rev-parse", "--is-inside-work-tree"], &[], None)?;
   if output != "true" {
-    return Err(CheckpointError::MissingMetadata(
+    return Err(CheckpointError::NotARepository(
       "Checkpoint requires a git worktree".to_string(),
     ));
   }
@@ -191,6 +197,8 @@ fn resolve_git_dir(repo_path: &Path) -> Result<PathBuf, CheckpointError> {
 fn extract_meta(body: &str, key: &str) -> Result<String, CheckpointError> {
   for line in body.lines() {
     if let Some(rest) = line.strip_prefix(key) {
+      let rest = rest.strip_prefix(' ').or_else(|| rest.strip_prefix('\t'));
+      let Some(rest) = rest else { continue };
       let value = rest.trim();
       if !value.is_empty() {
         return Ok(value.to_string());
@@ -260,6 +268,7 @@ fn create_temp_dir(prefix: &str) -> Result<TempDirGuard, CheckpointError> {
     .duration_since(UNIX_EPOCH)
     .map_err(|err| CheckpointError::Time(err.to_string()))?
     .as_millis();
+  let mut last_err: Option<std::io::Error> = None;
   for attempt in 0..100 {
     let candidate = base.join(format!(
       "{prefix}-{}-{}-{}",
@@ -270,12 +279,18 @@ fn create_temp_dir(prefix: &str) -> Result<TempDirGuard, CheckpointError> {
     match fs::create_dir(&candidate) {
       Ok(()) => return Ok(TempDirGuard { path: candidate }),
       Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-      Err(err) => return Err(CheckpointError::Io(err)),
+      Err(err) => {
+        last_err = Some(err);
+        continue;
+      }
     }
   }
-  Err(CheckpointError::Time(
-    "Failed to create temporary directory for checkpoint".to_string(),
-  ))
+  Err(last_err.map(CheckpointError::Io).unwrap_or_else(|| {
+    CheckpointError::Io(std::io::Error::new(
+      std::io::ErrorKind::Other,
+      "Failed to create temporary directory for checkpoint",
+    ))
+  }))
 }
 
 fn format_timestamp() -> Result<String, CheckpointError> {
@@ -283,5 +298,6 @@ fn format_timestamp() -> Result<String, CheckpointError> {
     .duration_since(UNIX_EPOCH)
     .map_err(|err| CheckpointError::Time(err.to_string()))?
     .as_secs();
-  Ok(format!("{stamp}"))
+  // Git accepts Unix timestamp with timezone offset.
+  Ok(format!("{stamp} +0000"))
 }

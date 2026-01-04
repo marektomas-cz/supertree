@@ -916,7 +916,13 @@ async fn sendSessionMessage(
         );
         None
       }
-      Err(err) => return Err(err.to_string()),
+      Err(err) => {
+        eprintln!(
+          "[checkpoint] failed for session {} turn {}: {}",
+          session.id, next_turn_id, err
+        );
+        None
+      }
     }
   } else {
     None
@@ -1102,13 +1108,7 @@ async fn resetSessionToTurn(
 
   let workspace_path = PathBuf::from(&workspace_record.path);
   restore_checkpoint(&workspace_path, &checkpoint_id).map_err(|err| err.to_string())?;
-  sessions::delete_session_messages_from_turn(db.pool(), &session.id, payload.turn_id)
-    .await
-    .map_err(|err| err.to_string())?;
-  sessions::clear_session_resume(db.pool(), &session.id)
-    .await
-    .map_err(|err| err.to_string())?;
-  sessions::set_session_status(db.pool(), &session.id, "idle")
+  sessions::reset_session_to_turn(db.pool(), &session.id, payload.turn_id)
     .await
     .map_err(|err| err.to_string())?;
 
