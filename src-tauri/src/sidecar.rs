@@ -22,6 +22,7 @@ type SidecarWriter = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
 const SOCKET_PATH_TIMEOUT_SECS: u64 = 30;
 const FRONTEND_RESPONSE_TIMEOUT_SECS: u64 = 120;
+const MAX_STORED_DIFF_BYTES: usize = 200_000;
 
 #[derive(Clone)]
 pub struct SidecarManager {
@@ -682,6 +683,33 @@ async fn handle_sidecar_message(
     if let Some(diff_stat) = get_workspace_diff_stat(db, &payload.id).await {
       if let Some(object) = metadata.as_object_mut() {
         object.insert("diffStat".to_string(), Value::String(diff_stat));
+      }
+    }
+    if payload.agent_type == "claude" {
+      let diff_payload = GetDiffPayload {
+        session_id: payload.id.clone(),
+        file: None,
+        stat: Some(false),
+      };
+      match get_diff_response(db, &diff_payload).await {
+        Ok(value) => {
+          if let Some(diff) = value.get("diff").and_then(|diff| diff.as_str()) {
+            let trimmed = diff.trim();
+            if !trimmed.is_empty() {
+              let mut stored = diff.to_string();
+              if stored.len() > MAX_STORED_DIFF_BYTES {
+                stored.truncate(MAX_STORED_DIFF_BYTES);
+                stored.push_str("\n...[truncated]");
+              }
+              if let Some(object) = metadata.as_object_mut() {
+                object.insert("diff".to_string(), Value::String(stored));
+              }
+            }
+          }
+        }
+        Err(err) => {
+          eprintln!("[sidecar] diff capture error: {err}");
+        }
       }
     }
   }

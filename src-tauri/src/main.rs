@@ -32,8 +32,9 @@ use libc;
 use crate::db::{Database, DbError};
 use crate::attachments::AttachmentRecord;
 use crate::git::{
-  branch_exists, clone_repo, create_worktree, inspect_repo, is_git_repo, read_supertree_config,
-  remove_worktree, repo_name_from_url, set_sparse_checkout,
+  branch_exists, clone_repo, create_worktree, diff as git_diff, inspect_repo, is_git_repo,
+  list_status, read_supertree_config, remove_worktree, repo_name_from_url, set_sparse_checkout,
+  GitStatusEntry,
 };
 use crate::paths::{ensure_dirs, resolve_paths, AppPaths};
 use crate::repos::{NewRepo, RepoRecord};
@@ -60,6 +61,12 @@ struct FilePreview {
   content: String,
   truncated: bool,
   binary: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceDiffResponse {
+  diff: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -123,6 +130,14 @@ enum AddRepoRequest {
 enum CreateWorkspaceRequest {
   Default { repo_id: String },
   Branch { repo_id: String, branch: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceDiffRequest {
+  workspace_id: String,
+  path: Option<String>,
+  stat: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1030,6 +1045,43 @@ async fn readWorkspaceFile(
     .map_err(|err| err.to_string())?
 }
 
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn getWorkspaceGitStatus(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+) -> Result<Vec<GitStatusEntry>, String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let workspace_path = PathBuf::from(workspace_record.path);
+  tauri::async_runtime::spawn_blocking(move || list_status(&workspace_path))
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn getWorkspaceDiff(
+  db: tauri::State<'_, Database>,
+  payload: WorkspaceDiffRequest,
+) -> Result<WorkspaceDiffResponse, String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &payload.workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let workspace_path = PathBuf::from(workspace_record.path);
+  let file_path = payload.path.as_ref().map(PathBuf::from);
+  let stat = payload.stat.unwrap_or(false);
+  tauri::async_runtime::spawn_blocking(move || {
+    git_diff(&workspace_path, file_path.as_deref(), stat)
+  })
+  .await
+  .map_err(|err| err.to_string())?
+  .map(|diff| WorkspaceDiffResponse { diff })
+  .map_err(|err| err.to_string())
+}
+
 fn spawn_run_output_reader(
   reader: impl Read + Send + 'static,
   window: tauri::Window,
@@ -1877,6 +1929,8 @@ fn main() {
       setWorkspaceSparseCheckout,
       listWorkspaceFiles,
       readWorkspaceFile,
+      getWorkspaceGitStatus,
+      getWorkspaceDiff,
       startRunScript,
       stopRunScript,
       createTerminal,
