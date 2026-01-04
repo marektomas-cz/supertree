@@ -1188,14 +1188,8 @@ export default function AppShell() {
   }, [loadSessions]);
 
   useEffect(() => {
-    let active = true;
-    loadReviewSettings().catch((err) => {
-      if (active) {
-        setSessionListError((prev) => prev ?? String(err));
-      }
-    });
+    void loadReviewSettings();
     return () => {
-      active = false;
     };
   }, [loadReviewSettings]);
 
