@@ -3672,6 +3672,8 @@ export default function AppShell() {
             </span>
           </div>
           <div
+            role="region"
+            aria-label="Composer dropzone"
             className="relative mt-3 space-y-3"
             onDragOver={handleComposerDragOver}
             onDragLeave={handleComposerDragLeave}
