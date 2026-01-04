@@ -1147,6 +1147,8 @@ async fn resetSessionToTurn(
       .unwrap_or(0);
     format!("session-{}-turn-{}-rollback-{}", session.id, payload.turn_id, stamp)
   };
+  // Create a rollback checkpoint so we can restore the current workspace if DB reset fails.
+  // This is best-effort: failure here should not block the reset attempt.
   let rollback_checkpoint = match create_checkpoint(&workspace_path, &rollback_checkpoint_id) {
     Ok(CheckpointOutcome::Created) => Some(rollback_checkpoint_id),
     Ok(CheckpointOutcome::Skipped { reason }) => {
@@ -1164,7 +1166,11 @@ async fn resetSessionToTurn(
       None
     }
   };
+  // Restore the target checkpoint. If this fails, we must abort the reset.
   restore_checkpoint(&workspace_path, &checkpoint_id).map_err(|err| err.to_string())?;
+  // Attempt DB reset. If it fails, try to restore the rollback checkpoint to avoid
+  // leaving the workspace and DB out of sync. Rollback failures are logged and may
+  // leave the workspace reverted while DB state remains unchanged.
   if let Err(err) = sessions::reset_session_to_turn(db.pool(), &session.id, payload.turn_id).await
   {
     if let Some(rollback_id) = rollback_checkpoint.as_deref() {
@@ -1174,6 +1180,7 @@ async fn resetSessionToTurn(
           session.id, payload.turn_id, rollback_err
         );
       }
+      // Cleanup failure here leaves the rollback ref behind but does not affect workspace.
       if let Err(cleanup_err) = delete_checkpoint(&workspace_path, rollback_id) {
         eprintln!(
           "[checkpoint] rollback cleanup failed for session {} turn {}: {}",
@@ -1185,6 +1192,7 @@ async fn resetSessionToTurn(
       "Reset failed after restoring checkpoint; workspace may be reverted: {err}"
     ));
   }
+  // Cleanup rollback checkpoint after successful DB reset. Failure leaves a stale ref.
   if let Some(rollback_id) = rollback_checkpoint.as_deref() {
     if let Err(cleanup_err) = delete_checkpoint(&workspace_path, rollback_id) {
       eprintln!(
