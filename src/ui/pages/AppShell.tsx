@@ -197,7 +197,9 @@ const buildFileTree = (files: string[]): FileTreeNode[] => {
           isFile: index === parts.length - 1,
         };
       }
-      if (index === parts.length - 1) {
+      if (index < parts.length - 1) {
+        current[part].isFile = false;
+      } else if (Object.keys(current[part].children).length === 0) {
         current[part].isFile = true;
       }
       current = current[part].children;
@@ -1189,8 +1191,6 @@ export default function AppShell() {
 
   useEffect(() => {
     void loadReviewSettings();
-    return () => {
-    };
   }, [loadReviewSettings]);
 
   useEffect(() => {
@@ -2536,9 +2536,27 @@ export default function AppShell() {
       ...prev,
       [activeWorkspaceId]: prev[activeWorkspaceId] ?? null,
     }));
-    loadGitStatus(activeWorkspaceId);
-    loadWorkspaceDiff(activeWorkspaceId, null);
-  }, [activeWorkspaceId, loadGitStatus, loadWorkspaceDiff]);
+    const hasGitStatus = Object.prototype.hasOwnProperty.call(
+      gitStatusByWorkspace,
+      activeWorkspaceId,
+    );
+    if (!hasGitStatus) {
+      loadGitStatus(activeWorkspaceId);
+    }
+    const hasWorkspaceDiff = Object.prototype.hasOwnProperty.call(
+      workspaceDiffByWorkspace,
+      activeWorkspaceId,
+    );
+    if (!hasWorkspaceDiff) {
+      loadWorkspaceDiff(activeWorkspaceId, null);
+    }
+  }, [
+    activeWorkspaceId,
+    gitStatusByWorkspace,
+    loadGitStatus,
+    loadWorkspaceDiff,
+    workspaceDiffByWorkspace,
+  ]);
 
   useEffect(() => {
     if (!activeWorkspaceId) {
