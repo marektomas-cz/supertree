@@ -20,6 +20,8 @@ pub struct WorkspaceRecord {
   pub pinned_at: Option<String>,
   pub unread: bool,
   pub base_port: Option<i64>,
+  pub setup_log_path: Option<String>,
+  pub archive_log_path: Option<String>,
 }
 
 /// Data required to insert a new workspace record.
@@ -31,6 +33,8 @@ pub struct NewWorkspace {
   pub path: String,
   pub state: String,
   pub base_port: Option<i64>,
+  pub setup_log_path: Option<String>,
+  pub archive_log_path: Option<String>,
 }
 
 pub fn active_state() -> &'static str {
@@ -69,6 +73,7 @@ pub async fn allocate_base_port(pool: &SqlitePool) -> Result<i64, DbError> {
 pub async fn list_workspaces(pool: &SqlitePool) -> Result<Vec<WorkspaceRecord>, DbError> {
   let rows = sqlx::query_as::<_, WorkspaceRecord>(
     "SELECT id, repo_id, branch, directory_name, path, state, pinned_at, unread, base_port
+            , setup_log_path, archive_log_path
      FROM workspaces
      ORDER BY created_at DESC",
   )
@@ -80,6 +85,7 @@ pub async fn list_workspaces(pool: &SqlitePool) -> Result<Vec<WorkspaceRecord>, 
 pub async fn get_workspace(pool: &SqlitePool, workspace_id: &str) -> Result<WorkspaceRecord, DbError> {
   let row = sqlx::query_as::<_, WorkspaceRecord>(
     "SELECT id, repo_id, branch, directory_name, path, state, pinned_at, unread, base_port
+            , setup_log_path, archive_log_path
      FROM workspaces
      WHERE id = ?",
   )
@@ -108,8 +114,8 @@ pub async fn find_active_workspace_for_branch(
 pub async fn insert_workspace(pool: &SqlitePool, new_workspace: NewWorkspace) -> Result<WorkspaceRecord, DbError> {
   let result = sqlx::query(
     "INSERT INTO workspaces
-      (id, repo_id, branch, directory_name, path, state, base_port)
-     VALUES (?, ?, ?, ?, ?, ?, ?)",
+      (id, repo_id, branch, directory_name, path, state, base_port, setup_log_path, archive_log_path)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
   )
   .bind(&new_workspace.id)
   .bind(&new_workspace.repo_id)
@@ -118,6 +124,8 @@ pub async fn insert_workspace(pool: &SqlitePool, new_workspace: NewWorkspace) ->
   .bind(&new_workspace.path)
   .bind(&new_workspace.state)
   .bind(new_workspace.base_port)
+  .bind(&new_workspace.setup_log_path)
+  .bind(&new_workspace.archive_log_path)
   .execute(pool)
   .await;
   match result {
@@ -145,6 +153,26 @@ pub async fn set_workspace_state(
      WHERE id = ?",
   )
   .bind(state)
+  .bind(workspace_id)
+  .execute(pool)
+  .await?;
+  if result.rows_affected() == 0 {
+    return Err(DbError::NotFound(format!("Workspace not found: {workspace_id}")));
+  }
+  Ok(())
+}
+
+pub async fn set_workspace_archive_log_path(
+  pool: &SqlitePool,
+  workspace_id: &str,
+  log_path: &str,
+) -> Result<(), DbError> {
+  let result = sqlx::query(
+    "UPDATE workspaces
+     SET archive_log_path = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?",
+  )
+  .bind(log_path)
   .bind(workspace_id)
   .execute(pool)
   .await?;

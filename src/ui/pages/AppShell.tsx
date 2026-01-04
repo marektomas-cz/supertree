@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import CommandPalette, { type CommandPaletteItem } from '@/components/CommandPalette';
 import FileOpener from '@/components/FileOpener';
+import TerminalPanel from '@/components/TerminalPanel';
 import { Button } from '@/components/ui/button';
 import {
   Tooltip,
@@ -21,6 +23,31 @@ type ChatSession = {
   workspaceId: string;
   title: string;
   model: string;
+};
+
+type RunOutputEvent = {
+  workspaceId: string;
+  stream: 'stdout' | 'stderr';
+  line: string;
+};
+
+type RunExitEvent = {
+  workspaceId: string;
+  code: number | null;
+};
+
+type TerminalExitEvent = {
+  terminalId: string;
+};
+
+type RunOutputEntry = {
+  stream: 'stdout' | 'stderr';
+  line: string;
+};
+
+type TerminalSession = {
+  id: string;
+  label: string;
 };
 
 const STORAGE_KEYS = {
@@ -70,6 +97,8 @@ index 5b8c3d2..c19b2e1 100644
      </section>
    );
  }`;
+
+const RUN_OUTPUT_LIMIT = 400;
 
 /**
  * Top-level shell layout with left navigation and main content area.
@@ -153,6 +182,25 @@ export default function AppShell() {
   >({});
   const [rightPanelTab, setRightPanelTab] = useState<'run' | 'terminal'>('run');
   const [gitPanelTab, setGitPanelTab] = useState<'changes' | 'files'>('changes');
+  const [runStatusByWorkspace, setRunStatusByWorkspace] = useState<
+    Record<string, 'idle' | 'running'>
+  >({});
+  const [runOutputByWorkspace, setRunOutputByWorkspace] = useState<
+    Record<string, RunOutputEntry[]>
+  >({});
+  const [runErrorByWorkspace, setRunErrorByWorkspace] = useState<
+    Record<string, string | null>
+  >({});
+  const [terminalErrorByWorkspace, setTerminalErrorByWorkspace] = useState<
+    Record<string, string | null>
+  >({});
+  const [terminalSessionsByWorkspace, setTerminalSessionsByWorkspace] = useState<
+    Record<string, TerminalSession[]>
+  >({});
+  const [activeTerminalByWorkspace, setActiveTerminalByWorkspace] = useState<
+    Record<string, string | null>
+  >({});
+  const [terminalFocusToken, setTerminalFocusToken] = useState(0);
   const [fileListVisibleCount, setFileListVisibleCount] = useState(20);
 
   const selectedRepo = useMemo(
@@ -169,6 +217,7 @@ export default function AppShell() {
     }
     return repos.find((repo) => repo.id === selectedWorkspace.repoId) ?? null;
   }, [repos, selectedWorkspace]);
+  const runScript = selectedWorkspaceRepo?.scriptsRun?.trim() ?? null;
   const activeWorkspaceId = selectedWorkspace?.id ?? null;
   const activeSessions = useMemo(() => {
     if (!activeWorkspaceId) {
@@ -206,6 +255,24 @@ export default function AppShell() {
     }
     return filePreviewByWorkspace[activeWorkspaceId] ?? null;
   }, [activeWorkspaceId, filePreviewByWorkspace]);
+  const activeRunStatus = activeWorkspaceId
+    ? runStatusByWorkspace[activeWorkspaceId] ?? 'idle'
+    : 'idle';
+  const activeRunOutput = activeWorkspaceId
+    ? runOutputByWorkspace[activeWorkspaceId] ?? []
+    : [];
+  const activeRunError = activeWorkspaceId
+    ? runErrorByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const activeTerminalError = activeWorkspaceId
+    ? terminalErrorByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const activeTerminalSessions = activeWorkspaceId
+    ? terminalSessionsByWorkspace[activeWorkspaceId] ?? []
+    : [];
+  const activeTerminalId = activeWorkspaceId
+    ? activeTerminalByWorkspace[activeWorkspaceId] ?? activeTerminalSessions[0]?.id ?? null
+    : null;
   const visibleFileCount = Math.min(fileListVisibleCount, workspaceFiles.length);
   const fileListIsTruncated = workspaceFiles.length > visibleFileCount;
   const showLeftSidebar = leftSidebarVisible && !zenMode;
@@ -360,6 +427,76 @@ export default function AppShell() {
     leftSidebarWidth,
     rightSidebarWidth,
   ]);
+
+  useEffect(() => {
+    const runOutputUnlisten = listen<RunOutputEvent>('run-output', (event) => {
+      const { workspaceId, stream, line } = event.payload;
+      const entry: RunOutputEntry = {
+        stream: stream === 'stderr' ? 'stderr' : 'stdout',
+        line,
+      };
+      setRunOutputByWorkspace((prev) => {
+        const existing = prev[workspaceId] ?? [];
+        const next = [...existing, entry];
+        if (next.length > RUN_OUTPUT_LIMIT) {
+          next.splice(0, next.length - RUN_OUTPUT_LIMIT);
+        }
+        return { ...prev, [workspaceId]: next };
+      });
+    });
+    const runExitUnlisten = listen<RunExitEvent>('run-exit', (event) => {
+      const { workspaceId, code } = event.payload;
+      setRunStatusByWorkspace((prev) => ({ ...prev, [workspaceId]: 'idle' }));
+      setRunOutputByWorkspace((prev) => {
+        const existing = prev[workspaceId] ?? [];
+        const line =
+          code === 0
+            ? 'Run completed successfully.'
+            : `Run exited with code ${code ?? 'unknown'}.`;
+        const entry: RunOutputEntry = { stream: 'stdout', line };
+        const next = [...existing, entry];
+        if (next.length > RUN_OUTPUT_LIMIT) {
+          next.splice(0, next.length - RUN_OUTPUT_LIMIT);
+        }
+        return { ...prev, [workspaceId]: next };
+      });
+    });
+    const terminalExitUnlisten = listen<TerminalExitEvent>(
+      'terminal-exit',
+      (event) => {
+        const { terminalId } = event.payload;
+        setTerminalSessionsByWorkspace((prev) => {
+          const next = { ...prev };
+          let affectedWorkspace: string | null = null;
+          for (const [workspaceId, sessions] of Object.entries(prev)) {
+            if (!sessions.some((session) => session.id === terminalId)) {
+              continue;
+            }
+            next[workspaceId] = sessions.filter(
+              (session) => session.id !== terminalId,
+            );
+            affectedWorkspace = workspaceId;
+          }
+          if (affectedWorkspace) {
+            setActiveTerminalByWorkspace((activePrev) => {
+              const updated = { ...activePrev };
+              const remaining = next[affectedWorkspace] ?? [];
+              if (activePrev[affectedWorkspace] === terminalId) {
+                updated[affectedWorkspace] = remaining[0]?.id ?? null;
+              }
+              return updated;
+            });
+          }
+          return next;
+        });
+      },
+    );
+    return () => {
+      void runOutputUnlisten.then((unlisten) => unlisten());
+      void runExitUnlisten.then((unlisten) => unlisten());
+      void terminalExitUnlisten.then((unlisten) => unlisten());
+    };
+  }, []);
 
   useEffect(() => {
     const handleMove = (event: MouseEvent) => {
@@ -625,6 +762,57 @@ export default function AppShell() {
     [activeSessionByWorkspace, sessionsByWorkspace],
   );
 
+  const handleCreateTerminal = useCallback(
+    async (workspaceId: string, focusAfterCreate = false) => {
+      setTerminalErrorByWorkspace((prev) => ({ ...prev, [workspaceId]: null }));
+      try {
+        const terminalId = await invoke<string>('createTerminal', {
+          workspaceId,
+          cols: 80,
+          rows: 24,
+        });
+        setTerminalSessionsByWorkspace((prev) => {
+          const list = prev[workspaceId] ?? [];
+          const next = [
+            ...list,
+            { id: terminalId, label: `Terminal ${list.length + 1}` },
+          ];
+          return { ...prev, [workspaceId]: next };
+        });
+        setActiveTerminalByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: terminalId,
+        }));
+        if (focusAfterCreate) {
+          setTerminalFocusToken((prev) => prev + 1);
+        }
+      } catch (err) {
+        setTerminalErrorByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: String(err),
+        }));
+      }
+    },
+    [],
+  );
+
+  const handleFocusTerminal = useCallback(() => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    setRightPanelTab('terminal');
+    const sessions = terminalSessionsByWorkspace[activeWorkspaceId] ?? [];
+    if (sessions.length === 0) {
+      void handleCreateTerminal(activeWorkspaceId, true);
+      return;
+    }
+    setActiveTerminalByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: prev[activeWorkspaceId] ?? sessions[0].id,
+    }));
+    setTerminalFocusToken((prev) => prev + 1);
+  }, [activeWorkspaceId, handleCreateTerminal, terminalSessionsByWorkspace]);
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -648,6 +836,11 @@ export default function AppShell() {
       if (primary && key === 't') {
         event.preventDefault();
         handleNewChat();
+        return;
+      }
+      if (primary && event.code === 'Backquote') {
+        event.preventDefault();
+        handleFocusTerminal();
         return;
       }
       if (primary && key === 'b') {
@@ -679,7 +872,14 @@ export default function AppShell() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleNewChat, isMac, toggleLeftSidebar, toggleRightSidebar, toggleZenMode]);
+  }, [
+    handleFocusTerminal,
+    handleNewChat,
+    isMac,
+    toggleLeftSidebar,
+    toggleRightSidebar,
+    toggleZenMode,
+  ]);
 
   const loadWorkspaceFiles = useCallback(
     async (workspaceId: string) => {
@@ -729,6 +929,84 @@ export default function AppShell() {
       } catch (err) {
         setFilePreviewError(String(err));
       }
+    },
+    [],
+  );
+
+  const handleRunScript = useCallback(async () => {
+    if (!activeWorkspaceId || !runScript) {
+      return;
+    }
+    setRunErrorByWorkspace((prev) => ({ ...prev, [activeWorkspaceId]: null }));
+    setRunStatusByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: 'running',
+    }));
+    setRunOutputByWorkspace((prev) => {
+      const existing = prev[activeWorkspaceId] ?? [];
+      const entry: RunOutputEntry = {
+        stream: 'stdout',
+        line: 'Starting run script...',
+      };
+      const next = [...existing, entry];
+      return { ...prev, [activeWorkspaceId]: next };
+    });
+    try {
+      await invoke('startRunScript', { workspaceId: activeWorkspaceId });
+    } catch (err) {
+      setRunStatusByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: 'idle',
+      }));
+      setRunErrorByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: String(err),
+      }));
+    }
+  }, [activeWorkspaceId, runScript]);
+
+  const handleStopRunScript = useCallback(async () => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    try {
+      await invoke('stopRunScript', { workspaceId: activeWorkspaceId });
+    } catch (err) {
+      setRunErrorByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: String(err),
+      }));
+    }
+  }, [activeWorkspaceId]);
+
+  const handleSelectTerminal = useCallback((workspaceId: string, terminalId: string) => {
+    setActiveTerminalByWorkspace((prev) => ({ ...prev, [workspaceId]: terminalId }));
+  }, []);
+
+  const handleCloseTerminal = useCallback(
+    async (workspaceId: string, terminalId: string) => {
+      try {
+        await invoke('closeTerminal', { terminalId });
+      } catch (err) {
+        setTerminalErrorByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: String(err),
+        }));
+      }
+      setTerminalSessionsByWorkspace((prev) => {
+        const list = prev[workspaceId] ?? [];
+        const nextList = list.filter((session) => session.id !== terminalId);
+        setActiveTerminalByWorkspace((activePrev) => {
+          if (activePrev[workspaceId] !== terminalId) {
+            return activePrev;
+          }
+          return {
+            ...activePrev,
+            [workspaceId]: nextList[0]?.id ?? null,
+          };
+        });
+        return { ...prev, [workspaceId]: nextList };
+      });
     },
     [],
   );
@@ -1694,7 +1972,7 @@ export default function AppShell() {
 
             <div className="border-t border-slate-800 p-4">
               <div className="flex items-center justify-between">
-                <div className="text-sm font-semibold">Run / Terminal</div>
+                <div className="text-sm font-semibold">Run / Terminal</div>     
                 <div className="flex gap-2">
                   <button
                     type="button"
@@ -1720,10 +1998,92 @@ export default function AppShell() {
                   </button>
                 </div>
               </div>
-              <div className="mt-3 rounded-md border border-slate-800 bg-slate-900/40 p-3 text-xs text-slate-500">
-                {rightPanelTab === 'run'
-                  ? 'Run output placeholder.'
-                  : 'Terminal output placeholder.'}
+              <div className="mt-3 space-y-3">
+                {rightPanelTab === 'run' ? (
+                  <>
+                    <div className="flex items-center justify-between text-xs text-slate-400">
+                      <span className="truncate">
+                        {activeWorkspaceId
+                          ? runScript
+                            ? `Script: ${runScript}`
+                            : 'No run script configured.'
+                          : 'Select a workspace to run scripts.'}
+                      </span>
+                      <Button
+                        size="sm"
+                        variant={activeRunStatus === 'running' ? 'outline' : 'default'}
+                        disabled={!activeWorkspaceId || !runScript}
+                        onClick={
+                          activeRunStatus === 'running'
+                            ? handleStopRunScript
+                            : handleRunScript
+                        }
+                        className={
+                          activeRunStatus === 'running'
+                            ? 'border-red-500/40 text-red-200 hover:bg-red-500/10'
+                            : undefined
+                        }
+                      >
+                        {activeRunStatus === 'running' ? 'Stop' : 'Run'}
+                      </Button>
+                    </div>
+                    {activeRunError ? (
+                      <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                        {activeRunError}
+                      </div>
+                    ) : null}
+                    <div className="h-40 overflow-auto rounded-md border border-slate-800 bg-slate-900/40 p-3 text-xs text-slate-200">
+                      {activeRunOutput.length === 0 ? (
+                        <div className="text-slate-500">
+                          Run output will appear here.
+                        </div>
+                      ) : (
+                        <div className="space-y-1 font-mono">
+                          {activeRunOutput.map((entry, index) => (
+                            <div
+                              key={`${index}-${entry.line}`}
+                              className={
+                                entry.stream === 'stderr'
+                                  ? 'text-amber-300'
+                                  : 'text-slate-200'
+                              }
+                            >
+                              {entry.line}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    {activeTerminalError ? (
+                      <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                        {activeTerminalError}
+                      </div>
+                    ) : null}
+                    {!activeWorkspaceId ? (
+                      <div className="rounded-md border border-slate-800 bg-slate-900/40 p-3 text-xs text-slate-500">
+                        Select a workspace to open terminals.
+                      </div>
+                    ) : (
+                      <TerminalPanel
+                        sessions={activeTerminalSessions}
+                        activeSessionId={activeTerminalId}
+                        onSelect={(terminalId) =>
+                          handleSelectTerminal(activeWorkspaceId, terminalId)
+                        }
+                        onClose={(terminalId) =>
+                          handleCloseTerminal(activeWorkspaceId, terminalId)
+                        }
+                        onCreate={() =>
+                          handleCreateTerminal(activeWorkspaceId, true)
+                        }
+                        focusToken={terminalFocusToken}
+                      />
+                    )}
+                  </>
+                )}
               </div>
             </div>
           </aside>
