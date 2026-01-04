@@ -807,12 +807,16 @@ async fn cancelSession(
 #[allow(non_snake_case)]
 #[tauri::command]
 async fn updatePermissionMode(
+  db: tauri::State<'_, Database>,
   sidecar: tauri::State<'_, SidecarManager>,
   session_id: String,
   permission_mode: String,
 ) -> Result<(), String> {
+  let session = sessions::get_session(db.pool(), &session_id)
+    .await
+    .map_err(|err| err.to_string())?;
   sidecar
-    .update_permission_mode(&session_id, &permission_mode)
+    .update_permission_mode(&session_id, &session.agent_type, &permission_mode)
     .await
 }
 

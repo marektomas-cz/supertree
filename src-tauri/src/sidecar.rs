@@ -248,8 +248,12 @@ impl SidecarManager {
   pub async fn update_permission_mode(
     &self,
     session_id: &str,
+    agent_type: &str,
     mode: &str,
   ) -> Result<(), String> {
+    if !matches!(agent_type, "claude" | "codex") {
+      return Err(format!("Unknown agent type: {agent_type}"));
+    }
     let session = self.ensure_session(session_id).await?;
     let payload = json!({
       "jsonrpc": "2.0",
@@ -257,7 +261,7 @@ impl SidecarManager {
       "params": {
         "type": "update_permission_mode",
         "id": session_id,
-        "agentType": "claude",
+        "agentType": agent_type,
         "permissionMode": mode,
       }
     });
