@@ -5,17 +5,22 @@ mod git;
 mod paths;
 mod repos;
 mod settings;
+mod sessions;
+mod sidecar;
 mod workspace;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::time::Duration;
 use tauri::{Emitter, Manager};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 #[cfg(unix)]
@@ -31,6 +36,8 @@ use crate::git::{
 use crate::paths::{ensure_dirs, resolve_paths, AppPaths};
 use crate::repos::{NewRepo, RepoRecord};
 use crate::settings::SettingEntry;
+use crate::sidecar::SidecarManager;
+use crate::sessions::{SessionMessageRecord, SessionRecord};
 
 #[tauri::command]
 fn hello(name: String) -> String {
@@ -123,6 +130,37 @@ enum OpenTarget {
   Vscode,
   Cursor,
   Zed,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSessionRequest {
+  workspace_id: String,
+  agent_type: String,
+  model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendSessionMessageRequest {
+  session_id: String,
+  prompt: String,
+  permission_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveAskUserQuestionRequest {
+  request_id: String,
+  answers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveExitPlanModeRequest {
+  request_id: String,
+  approved: bool,
+  turn_id: Option<i64>,
 }
 
 #[allow(non_snake_case)]
@@ -572,6 +610,238 @@ async fn markWorkspaceUnread(
   workspace::set_workspace_unread(db.pool(), &workspace_id, unread)
     .await
     .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn listSessions(db: tauri::State<'_, Database>) -> Result<Vec<SessionRecord>, String> {
+  sessions::list_sessions(db.pool())
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn createSession(
+  db: tauri::State<'_, Database>,
+  payload: CreateSessionRequest,
+) -> Result<SessionRecord, String> {
+  let agent_type = payload.agent_type.to_lowercase();
+  if agent_type != "claude" && agent_type != "codex" {
+    return Err("Unsupported agent type".to_string());
+  }
+  let _workspace = workspace::get_workspace(db.pool(), &payload.workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+
+  let count: i64 = sqlx::query_scalar(
+    "SELECT COUNT(*) FROM sessions WHERE workspace_id = ?",
+  )
+  .bind(&payload.workspace_id)
+  .fetch_one(db.pool())
+  .await
+  .map_err(|err| err.to_string())?;
+  let title = Some(format!("Chat {}", count + 1));
+
+  sessions::insert_session(
+    db.pool(),
+    sessions::NewSession {
+      workspace_id: payload.workspace_id,
+      title,
+      agent_type,
+      model: payload.model,
+      status: "idle".to_string(),
+    },
+  )
+  .await
+  .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn deleteSession(
+  db: tauri::State<'_, Database>,
+  sidecar: tauri::State<'_, SidecarManager>,
+  session_id: String,
+) -> Result<(), String> {
+  sidecar.close_session(&session_id).await;
+  sessions::delete_session(db.pool(), &session_id)
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn listSessionMessages(
+  db: tauri::State<'_, Database>,
+  session_id: String,
+) -> Result<Vec<SessionMessageRecord>, String> {
+  sessions::list_session_messages(db.pool(), &session_id)
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn sendSessionMessage(
+  db: tauri::State<'_, Database>,
+  sidecar: tauri::State<'_, SidecarManager>,
+  payload: SendSessionMessageRequest,
+) -> Result<SessionMessageRecord, String> {
+  let prompt = payload.prompt.trim();
+  if prompt.is_empty() {
+    return Err("Prompt is required".to_string());
+  }
+  let session = sessions::get_session(db.pool(), &payload.session_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let workspace_record = workspace::get_workspace(db.pool(), &session.workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let env_vars_raw = settings::get_env_vars(db.pool())
+    .await
+    .map_err(|err| err.to_string())?;
+
+  let turn_id = sessions::next_turn_id(db.pool(), &session.id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let message_id = sessions::generate_message_id(db.pool())
+    .await
+    .map_err(|err| err.to_string())?;
+
+  let user_message = sessions::insert_session_message(
+    db.pool(),
+    sessions::NewSessionMessage {
+      id: message_id,
+      session_id: session.id.clone(),
+      turn_id,
+      role: "user".to_string(),
+      content: prompt.to_string(),
+      metadata_json: None,
+    },
+  )
+  .await
+  .map_err(|err| err.to_string())?;
+
+  sessions::set_session_status(db.pool(), &session.id, "running")
+    .await
+    .map_err(|err| err.to_string())?;
+
+  let mut options = serde_json::Map::new();
+  options.insert("cwd".to_string(), Value::String(workspace_record.path));
+  if let Some(model) = session
+    .model
+    .clone()
+    .filter(|value| !value.trim().is_empty())
+  {
+    options.insert("model".to_string(), Value::String(model));
+  }
+  if let Some(permission_mode) = payload
+    .permission_mode
+    .clone()
+    .filter(|value| !value.trim().is_empty())
+  {
+    options.insert(
+      "permissionMode".to_string(),
+      Value::String(permission_mode),
+    );
+  }
+  match session.agent_type.as_str() {
+    "claude" => {
+      if let Some(resume) = session
+        .claude_session_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+      {
+        options.insert("resume".to_string(), Value::String(resume.clone()));
+      }
+    }
+    "codex" => {
+      if let Some(resume) = session
+        .codex_session_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+      {
+        options.insert("resume".to_string(), Value::String(resume.clone()));
+      }
+    }
+    _ => {}
+  }
+  if !env_vars_raw.trim().is_empty() {
+    options.insert(
+      "claudeEnvVars".to_string(),
+      Value::String(env_vars_raw.clone()),
+    );
+    let parsed = parse_env_vars(&env_vars_raw);
+    if !parsed.is_empty() {
+      let mut env_map = serde_json::Map::new();
+      for (key, value) in parsed {
+        env_map.insert(key, Value::String(value));
+      }
+      options.insert("conductorEnv".to_string(), Value::Object(env_map));
+    }
+  }
+  options.insert("turnId".to_string(), json!(turn_id));
+  let options = Value::Object(options);
+  sidecar
+    .send_query(&session.id, &session.agent_type, prompt, options, turn_id)
+    .await?;
+
+  Ok(user_message)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn cancelSession(
+  db: tauri::State<'_, Database>,
+  sidecar: tauri::State<'_, SidecarManager>,
+  session_id: String,
+) -> Result<(), String> {
+  let session = sessions::get_session(db.pool(), &session_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  sidecar
+    .cancel(&session.id, &session.agent_type)
+    .await?;
+  sessions::set_session_status(db.pool(), &session.id, "idle")
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn updatePermissionMode(
+  sidecar: tauri::State<'_, SidecarManager>,
+  session_id: String,
+  permission_mode: String,
+) -> Result<(), String> {
+  sidecar
+    .update_permission_mode(&session_id, &permission_mode)
+    .await
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn respondAskUserQuestion(
+  sidecar: tauri::State<'_, SidecarManager>,
+  payload: ResolveAskUserQuestionRequest,
+) -> Result<(), String> {
+  let response = json!({ "answers": payload.answers });
+  sidecar
+    .resolve_frontend_request(&payload.request_id, response)
+    .await
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn respondExitPlanMode(
+  sidecar: tauri::State<'_, SidecarManager>,
+  payload: ResolveExitPlanModeRequest,
+) -> Result<(), String> {
+  let response = json!({ "approved": payload.approved, "turnId": payload.turn_id });
+  sidecar
+    .resolve_frontend_request(&payload.request_id, response)
+    .await
 }
 
 #[allow(non_snake_case)]
@@ -1391,84 +1661,6 @@ fn build_shell_command(script: &str) -> Command {
   Command::new("true")
 }
 
-struct SidecarProcess {
-  child: Mutex<Option<Child>>,
-}
-
-impl SidecarProcess {
-  fn spawn() -> Result<Self, String> {
-    let entry = sidecar_entry()?;
-    if !entry.exists() {
-      let mut attempts = 0;
-      while attempts < 15 && !entry.exists() {
-        std::thread::sleep(Duration::from_millis(200));
-        attempts += 1;
-      }
-    }
-    if !entry.exists() {
-      return Err(format!(
-        "Sidecar bundle not found at {}. Run `npm --prefix sidecar run build`.",
-        entry.display()
-      ));
-    }
-
-    let mut child = Command::new("node")
-      .arg(entry)
-      .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
-      .spawn()
-      .map_err(|err| format!("Failed to spawn sidecar: {err}"))?;
-
-    if let Some(stdout) = child.stdout.take() {
-      spawn_output_logger(stdout, "sidecar");
-    }
-    if let Some(stderr) = child.stderr.take() {
-      spawn_output_logger(stderr, "sidecar-error");
-    }
-
-    Ok(Self {
-      child: Mutex::new(Some(child)),
-    })
-  }
-}
-
-impl Drop for SidecarProcess {
-  fn drop(&mut self) {
-    let Ok(mut guard) = self.child.lock() else {
-      eprintln!("Sidecar lock poisoned during shutdown");
-      return;
-    };
-
-    if let Some(mut child) = guard.take() {
-      if let Err(err) = child.kill() {
-        eprintln!("Failed to stop sidecar: {err}");
-      } else if let Err(err) = child.wait() {
-        eprintln!("Failed to wait for sidecar exit: {err}");
-      }
-    }
-  }
-}
-
-fn spawn_output_logger(reader: impl Read + Send + 'static, label: &'static str) {
-  std::thread::spawn(move || {
-    let buffer = BufReader::new(reader);
-    for line in buffer.lines() {
-      match line {
-        Ok(line) => println!("[{label}] {line}"),
-        Err(err) => eprintln!("[{label}] output error: {err}"),
-      }
-    }
-  });
-}
-
-fn sidecar_entry() -> Result<PathBuf, String> {
-  let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-  let root = manifest_dir
-    .parent()
-    .ok_or_else(|| "Missing project root".to_string())?;
-  Ok(root.join("sidecar").join("dist").join("index.js"))
-}
-
 fn main() {
   tauri::Builder::default()
     .setup(|app| {
@@ -1479,19 +1671,11 @@ fn main() {
       tauri::async_runtime::block_on(settings::ensure_defaults(db.pool()))
         .map_err(|err| err.to_string())?;
       app.manage(paths);
+      let sidecar_manager = SidecarManager::new(app.handle().clone(), db.clone());
       app.manage(db);
       app.manage(RunManager::default());
       app.manage(TerminalManager::default());
-      if cfg!(debug_assertions) {
-        match SidecarProcess::spawn() {
-          Ok(process) => {
-            app.manage(process);
-          }
-          Err(err) => {
-            eprintln!("Sidecar spawn skipped: {err}");
-          }
-        }
-      }
+      app.manage(sidecar_manager);
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![
@@ -1505,11 +1689,20 @@ fn main() {
       addRepo,
       removeRepo,
       listWorkspaces,
+      listSessions,
       createWorkspace,
+      createSession,
       archiveWorkspace,
+      deleteSession,
       unarchiveWorkspace,
+      listSessionMessages,
       pinWorkspace,
       markWorkspaceUnread,
+      sendSessionMessage,
+      cancelSession,
+      updatePermissionMode,
+      respondAskUserQuestion,
+      respondExitPlanMode,
       setWorkspaceSparseCheckout,
       listWorkspaceFiles,
       readWorkspaceFile,

@@ -13,16 +13,31 @@ import {
 } from '@/components/ui/tooltip';
 import { formatGreeting } from '@/lib/format';
 import type { OpenTarget, RepoInfo } from '@/types/repo';
+import type {
+  AskUserQuestionEvent,
+  ExitPlanModeEvent,
+  SessionErrorEvent,
+  SessionMessageEvent,
+  SessionMessageRecord,
+  SessionPlanModeEvent,
+  SessionRecord,
+  SessionStatusEvent,
+} from '@/types/session';
 import type { FilePreview, WorkspaceInfo } from '@/types/workspace';
 import RepositoryPage from './RepositoryPage';
 import SettingsPage from './SettingsPage';
 import WorkspacesPage from './WorkspacesPage';
 
-type ChatSession = {
+type SessionMessageItem = {
   id: string;
-  workspaceId: string;
-  title: string;
-  model: string;
+  sessionId: string;
+  role: string;
+  content: string;
+  turnId?: number;
+  sentAt?: string | null;
+  cancelledAt?: string | null;
+  metadata?: Record<string, unknown> | null;
+  streaming?: boolean;
 };
 
 type RunOutputEvent = {
@@ -95,6 +110,44 @@ const createRunOutputEntry = (
       ? cryptoObj.randomUUID()
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   return { id, stream, line };
+};
+
+const parseMetadataJson = (value?: string | null) => {
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object'
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+const normalizeSessionMessage = (
+  message: SessionMessageRecord,
+): SessionMessageItem => ({
+  id: message.id,
+  sessionId: message.sessionId,
+  role: message.role,
+  content: message.content,
+  turnId: message.turnId,
+  sentAt: message.sentAt ?? null,
+  cancelledAt: message.cancelledAt ?? null,
+  metadata: parseMetadataJson(message.metadataJson),
+  streaming: false,
+});
+
+const formatAgentLabel = (agentType: SessionRecord['agentType']) => {
+  if (agentType === 'codex') {
+    return 'Codex';
+  }
+  if (agentType === 'claude') {
+    return 'Claude';
+  }
+  return 'Unknown';
 };
 
 const DIFF_PLACEHOLDER = `diff --git a/src/main.tsx b/src/main.tsx
@@ -185,8 +238,36 @@ export default function AppShell() {
     Record<string, FilePreview | null>
   >({});
   const [sessionsByWorkspace, setSessionsByWorkspace] = useState<
-    Record<string, ChatSession[]>
+    Record<string, SessionRecord[]>
   >({});
+  const [messagesBySession, setMessagesBySession] = useState<
+    Record<string, SessionMessageItem[]>
+  >({});
+  const [sessionErrors, setSessionErrors] = useState<
+    Record<string, string | null>
+  >({});
+  const [sessionStatuses, setSessionStatuses] = useState<Record<string, string>>(
+    {},
+  );
+  const [planModeBySession, setPlanModeBySession] = useState<
+    Record<string, boolean>
+  >({});
+  const [permissionModeBySession, setPermissionModeBySession] = useState<
+    Record<string, string>
+  >({});
+  const [composerValue, setComposerValue] = useState('');
+  const [newChatAgentType, setNewChatAgentType] = useState<'claude' | 'codex'>(
+    'claude',
+  );
+  const [sessionListError, setSessionListError] = useState<string | null>(null);
+  const [sendError, setSendError] = useState<string | null>(null);
+  const [pendingAskQueue, setPendingAskQueue] = useState<AskUserQuestionEvent[]>(
+    [],
+  );
+  const [pendingExitQueue, setPendingExitQueue] = useState<ExitPlanModeEvent[]>(
+    [],
+  );
+  const [askAnswers, setAskAnswers] = useState<string[]>([]);
   const [activeSessionByWorkspace, setActiveSessionByWorkspace] = useState<
     Record<string, string | null>
   >({});
@@ -244,6 +325,40 @@ export default function AppShell() {
     }
     return activeSessionByWorkspace[activeWorkspaceId] ?? null;
   }, [activeSessionByWorkspace, activeWorkspaceId]);
+  const activeSession = useMemo(() => {
+    if (!activeSessionId) {
+      return null;
+    }
+    return activeSessions.find((session) => session.id === activeSessionId) ?? null;
+  }, [activeSessionId, activeSessions]);
+  const activeSessionStatus = useMemo(() => {
+    if (!activeSession) {
+      return 'idle';
+    }
+    return sessionStatuses[activeSession.id] ?? activeSession.status ?? 'idle';
+  }, [activeSession, sessionStatuses]);
+  const activeSessionMessages = useMemo(() => {
+    if (!activeSessionId) {
+      return [];
+    }
+    return messagesBySession[activeSessionId] ?? [];
+  }, [activeSessionId, messagesBySession]);
+  const activeSessionError = activeSessionId
+    ? sessionErrors[activeSessionId] ?? null
+    : null;
+  const activePlanMode = activeSessionId
+    ? planModeBySession[activeSessionId] ?? false
+    : false;
+  const activePermissionMode = activeSessionId
+    ? permissionModeBySession[activeSessionId] ?? 'default'
+    : 'default';
+  const canSendMessage =
+    Boolean(activeWorkspaceId) &&
+    composerValue.trim().length > 0 &&
+    activeSessionStatus !== 'running';
+  const canCancelSession = Boolean(activeSession) && activeSessionStatus === 'running';
+  const activeAskRequest = pendingAskQueue[0] ?? null;
+  const activeExitRequest = pendingExitQueue[0] ?? null;
   const activeTab = useMemo(() => {
     if (!activeWorkspaceId) {
       return 'changes';
@@ -369,6 +484,69 @@ export default function AppShell() {
     }
   }, []);
 
+  const loadSessions = useCallback(async () => {
+    setSessionListError(null);
+    try {
+      const data = await invoke<SessionRecord[]>('listSessions');
+      const grouped: Record<string, SessionRecord[]> = {};
+      for (const session of data) {
+        const list = grouped[session.workspaceId] ?? [];
+        list.push(session);
+        grouped[session.workspaceId] = list;
+      }
+      setSessionsByWorkspace(grouped);
+      setSessionStatuses(() => {
+        const next: Record<string, string> = {};
+        for (const session of data) {
+          next[session.id] = session.status;
+        }
+        return next;
+      });
+      setPermissionModeBySession((prev) => {
+        const next: Record<string, string> = {};
+        for (const session of data) {
+          next[session.id] = prev[session.id] ?? 'default';
+        }
+        return next;
+      });
+      setActiveSessionByWorkspace((prev) => {
+        const next = { ...prev };
+        for (const workspaceId of Object.keys(prev)) {
+          if (!grouped[workspaceId] || grouped[workspaceId].length === 0) {
+            next[workspaceId] = null;
+          }
+        }
+        for (const [workspaceId, sessions] of Object.entries(grouped)) {
+          const activeId = next[workspaceId];
+          if (activeId && !sessions.some((session) => session.id === activeId)) {
+            next[workspaceId] = sessions.length > 0 ? sessions[sessions.length - 1].id : null;
+            continue;
+          }
+          if (!activeId && sessions.length > 0) {
+            next[workspaceId] = sessions[sessions.length - 1].id;
+          }
+        }
+        return next;
+      });
+    } catch (err) {
+      setSessionListError(String(err));
+      setSessionsByWorkspace({});
+      throw err;
+    }
+  }, []);
+
+  const loadSessionMessages = useCallback(async (sessionId: string) => {
+    try {
+      const data = await invoke<SessionMessageRecord[]>('listSessionMessages', {
+        sessionId,
+      });
+      const normalized = data.map((message) => normalizeSessionMessage(message));
+      setMessagesBySession((prev) => ({ ...prev, [sessionId]: normalized }));
+    } catch (err) {
+      setSessionErrors((prev) => ({ ...prev, [sessionId]: String(err) }));
+    }
+  }, []);
+
   useEffect(() => {
     let active = true;
     if (activeView === 'home') {
@@ -414,6 +592,41 @@ export default function AppShell() {
       active = false;
     };
   }, [loadWorkspaces]);
+
+  useEffect(() => {
+    let active = true;
+    loadSessions().catch((err) => {
+      if (active) {
+        setSessionListError(String(err));
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [loadSessions]);
+
+  useEffect(() => {
+    if (!activeSessionId) {
+      return;
+    }
+    if (messagesBySession[activeSessionId]) {
+      return;
+    }
+    loadSessionMessages(activeSessionId);
+  }, [activeSessionId, loadSessionMessages, messagesBySession]);
+
+  useEffect(() => {
+    setSendError(null);
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    if (!activeAskRequest) {
+      return;
+    }
+    setAskAnswers(
+      activeAskRequest.questions.map((question) => question.options[0] ?? ''),
+    );
+  }, [activeAskRequest]);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -507,10 +720,84 @@ export default function AppShell() {
         }
       },
     );
+    const sessionMessageUnlisten = listen<SessionMessageEvent>(
+      'session-message',
+      (event) => {
+        const { sessionId, message } = event.payload;
+        setMessagesBySession((prev) => {
+          const existing = prev[sessionId] ?? [];
+          const index = existing.findIndex((item) => item.id === message.id);
+          const metadata =
+            message.metadata && typeof message.metadata === 'object'
+              ? (message.metadata as Record<string, unknown>)
+              : null;
+          const nextItem: SessionMessageItem = {
+            id: message.id,
+            sessionId,
+            role: message.role,
+            content: message.content,
+            metadata,
+            streaming: message.streaming,
+          };
+          if (index >= 0) {
+            const updated = [...existing];
+            const current = updated[index];
+            updated[index] = {
+              ...current,
+              ...nextItem,
+              turnId: current.turnId ?? nextItem.turnId,
+              sentAt: current.sentAt ?? nextItem.sentAt,
+              cancelledAt: current.cancelledAt ?? nextItem.cancelledAt,
+            };
+            return { ...prev, [sessionId]: updated };
+          }
+          return { ...prev, [sessionId]: [...existing, nextItem] };
+        });
+      },
+    );
+    const sessionErrorUnlisten = listen<SessionErrorEvent>(
+      'session-error',
+      (event) => {
+        const { sessionId, error } = event.payload;
+        setSessionErrors((prev) => ({ ...prev, [sessionId]: error }));
+        setSessionStatuses((prev) => ({ ...prev, [sessionId]: 'error' }));
+      },
+    );
+    const sessionStatusUnlisten = listen<SessionStatusEvent>(
+      'session-status',
+      (event) => {
+        const { sessionId, status } = event.payload;
+        setSessionStatuses((prev) => ({ ...prev, [sessionId]: status }));
+      },
+    );
+    const sessionPlanModeUnlisten = listen<SessionPlanModeEvent>(
+      'session-plan-mode',
+      (event) => {
+        const { sessionId } = event.payload;
+        setPlanModeBySession((prev) => ({ ...prev, [sessionId]: true }));
+      },
+    );
+    const sessionRequestUnlisten = listen<AskUserQuestionEvent | ExitPlanModeEvent>(
+      'session-request',
+      (event) => {
+        const payload = event.payload as AskUserQuestionEvent | ExitPlanModeEvent;
+        if ('questions' in payload) {
+          setPendingAskQueue((prev) => [...prev, payload]);
+          setAskAnswers(payload.questions.map((question) => question.options[0] ?? ''));
+        } else {
+          setPendingExitQueue((prev) => [...prev, payload]);
+        }
+      },
+    );
     return () => {
       void runOutputUnlisten.then((unlisten) => unlisten());
       void runExitUnlisten.then((unlisten) => unlisten());
       void terminalExitUnlisten.then((unlisten) => unlisten());
+      void sessionMessageUnlisten.then((unlisten) => unlisten());
+      void sessionErrorUnlisten.then((unlisten) => unlisten());
+      void sessionStatusUnlisten.then((unlisten) => unlisten());
+      void sessionPlanModeUnlisten.then((unlisten) => unlisten());
+      void sessionRequestUnlisten.then((unlisten) => unlisten());
     };
   }, []);
 
@@ -724,24 +1011,40 @@ export default function AppShell() {
     [rightSidebarWidth],
   );
 
-  const createChatSession = useCallback(
-    (workspaceId: string) => {
-      const sessionId = crypto.randomUUID();
-      const nextIndex = (sessionsByWorkspace[workspaceId]?.length ?? 0) + 1;
-      const session: ChatSession = {
-        id: sessionId,
-        workspaceId,
-        title: `Chat ${nextIndex}`,
-        model: 'Claude',
-      };
-      setSessionsByWorkspace((prev) => {
-        const list = prev[workspaceId] ?? [];
-        return { ...prev, [workspaceId]: [...list, session] };
-      });
-      setActiveSessionByWorkspace((prev) => ({ ...prev, [workspaceId]: sessionId }));
-      setActiveTabByWorkspace((prev) => ({ ...prev, [workspaceId]: 'session' }));
+  const createSessionForWorkspace = useCallback(
+    async (workspaceId: string, agentType = newChatAgentType) => {
+      setSessionListError(null);
+      try {
+        const session = await invoke<SessionRecord>('createSession', {
+          workspaceId,
+          agentType,
+          model: null,
+        });
+        setSessionsByWorkspace((prev) => {
+          const list = prev[workspaceId] ?? [];
+          return { ...prev, [workspaceId]: [...list, session] };
+        });
+        setMessagesBySession((prev) => ({ ...prev, [session.id]: [] }));
+        setSessionStatuses((prev) => ({ ...prev, [session.id]: session.status }));
+        setPermissionModeBySession((prev) => ({
+          ...prev,
+          [session.id]: prev[session.id] ?? 'default',
+        }));
+        setActiveSessionByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: session.id,
+        }));
+        setActiveTabByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: 'session',
+        }));
+        return session;
+      } catch (err) {
+        setSessionListError(String(err));
+        throw err;
+      }
     },
-    [sessionsByWorkspace],
+    [newChatAgentType],
   );
 
   const handleNewChat = useCallback(() => {
@@ -749,8 +1052,8 @@ export default function AppShell() {
       return;
     }
     setActiveView('workspace');
-    createChatSession(activeWorkspaceId);
-  }, [activeWorkspaceId, createChatSession, setActiveView]);
+    void createSessionForWorkspace(activeWorkspaceId);
+  }, [activeWorkspaceId, createSessionForWorkspace, setActiveView]);
 
   const handleSelectSession = useCallback((workspaceId: string, sessionId: string) => {
     setSelectedWorkspaceId(workspaceId);
@@ -760,12 +1063,42 @@ export default function AppShell() {
   }, []);
 
   const handleCloseSession = useCallback(
-    (workspaceId: string, sessionId: string) => {
+    async (workspaceId: string, sessionId: string) => {
       const isClosingActive = activeSessionByWorkspace[workspaceId] === sessionId;
       const remaining = (sessionsByWorkspace[workspaceId] ?? []).filter(
         (session) => session.id !== sessionId,
       );
       setSessionsByWorkspace((prev) => ({ ...prev, [workspaceId]: remaining }));
+      setMessagesBySession((prev) => {
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      });
+      setSessionErrors((prev) => {
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      });
+      setSessionStatuses((prev) => {
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      });
+      setPermissionModeBySession((prev) => {
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      });
+      setPlanModeBySession((prev) => {
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      });
+      try {
+        await invoke('deleteSession', { sessionId });
+      } catch (err) {
+        setSessionErrors((prev) => ({ ...prev, [sessionId]: String(err) }));
+      }
       if (isClosingActive) {
         const nextActive = remaining.length > 0 ? remaining[remaining.length - 1].id : null;
         setActiveSessionByWorkspace((prev) => ({ ...prev, [workspaceId]: nextActive }));
@@ -776,6 +1109,160 @@ export default function AppShell() {
       }
     },
     [activeSessionByWorkspace, sessionsByWorkspace],
+  );
+
+  const handleSendMessage = useCallback(async () => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    setActiveView('workspace');
+    const prompt = composerValue.trim();
+    if (!prompt) {
+      return;
+    }
+    if (activeSessionStatus === 'running') {
+      return;
+    }
+    setSendError(null);
+    setActiveTabByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: 'session',
+    }));
+    let session = activeSession;
+    if (!session) {
+      try {
+        session = await createSessionForWorkspace(activeWorkspaceId);
+      } catch {
+        return;
+      }
+    }
+    const permissionMode =
+      session.agentType === 'claude'
+        ? permissionModeBySession[session.id] ?? 'default'
+        : undefined;
+    try {
+      setSessionErrors((prev) => ({ ...prev, [session.id]: null }));
+      const userMessage = await invoke<SessionMessageRecord>('sendSessionMessage', {
+        sessionId: session.id,
+        prompt,
+        permissionMode,
+      });
+      const normalized = normalizeSessionMessage(userMessage);
+      setMessagesBySession((prev) => {
+        const list = prev[session!.id] ?? [];
+        return { ...prev, [session!.id]: [...list, normalized] };
+      });
+      setComposerValue('');
+      setSessionStatuses((prev) => ({ ...prev, [session!.id]: 'running' }));
+    } catch (err) {
+      setSendError(String(err));
+      setSessionErrors((prev) => ({ ...prev, [session!.id]: String(err) }));
+    }
+  }, [
+    activeSession,
+    activeSessionStatus,
+    activeWorkspaceId,
+    composerValue,
+    createSessionForWorkspace,
+    permissionModeBySession,
+  ]);
+
+  const handleCancelSession = useCallback(async () => {
+    if (!activeSession) {
+      return;
+    }
+    setSendError(null);
+    try {
+      await invoke('cancelSession', { sessionId: activeSession.id });
+      setSessionStatuses((prev) => ({ ...prev, [activeSession.id]: 'idle' }));
+    } catch (err) {
+      setSendError(String(err));
+    }
+  }, [activeSession]);
+
+  const handlePermissionModeChange = useCallback(
+    async (mode: string) => {
+      if (!activeSession) {
+        return;
+      }
+      setPermissionModeBySession((prev) => ({ ...prev, [activeSession.id]: mode }));
+      if (activeSession.agentType !== 'claude') {
+        return;
+      }
+      try {
+        await invoke('updatePermissionMode', {
+          sessionId: activeSession.id,
+          permissionMode: mode,
+        });
+      } catch (err) {
+        setSendError(String(err));
+      }
+    },
+    [activeSession],
+  );
+
+  const handleComposerKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        void handleSendMessage();
+      }
+    },
+    [handleSendMessage],
+  );
+
+  const handleResolveAskUserQuestion = useCallback(async () => {
+    if (!activeAskRequest) {
+      return;
+    }
+    try {
+      await invoke('respondAskUserQuestion', {
+        requestId: activeAskRequest.requestId,
+        answers: askAnswers,
+      });
+      setPendingAskQueue((prev) => prev.slice(1));
+      setAskAnswers([]);
+    } catch (err) {
+      setSendError(String(err));
+    }
+  }, [activeAskRequest, askAnswers]);
+  const handleCancelAskUserQuestion = useCallback(async () => {
+    if (!activeAskRequest) {
+      return;
+    }
+    try {
+      await invoke('respondAskUserQuestion', {
+        requestId: activeAskRequest.requestId,
+        answers: ['USER_CANCELLED'],
+      });
+      setPendingAskQueue((prev) => prev.slice(1));
+      setAskAnswers([]);
+    } catch (err) {
+      setSendError(String(err));
+    }
+  }, [activeAskRequest]);
+
+  const handleResolveExitPlanMode = useCallback(
+    async (approved: boolean) => {
+      if (!activeExitRequest) {
+        return;
+      }
+      try {
+        await invoke('respondExitPlanMode', {
+          requestId: activeExitRequest.requestId,
+          approved,
+          turnId: null,
+        });
+        setPendingExitQueue((prev) => prev.slice(1));
+        setPlanModeBySession((prev) => ({
+          ...prev,
+          [activeExitRequest.sessionId]: false,
+        }));
+      } catch (err) {
+        setSendError(String(err));
+      }
+    },
+    [activeExitRequest],
   );
 
   const handleCreateTerminal = useCallback(
@@ -922,6 +1409,23 @@ export default function AppShell() {
       }));
     }
   }, [activeWorkspaceId, filesByWorkspace, loadWorkspaceFiles]);
+
+  useEffect(() => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    if (activeSessionByWorkspace[activeWorkspaceId]) {
+      return;
+    }
+    const sessions = sessionsByWorkspace[activeWorkspaceId] ?? [];
+    if (sessions.length === 0) {
+      return;
+    }
+    setActiveSessionByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: sessions[sessions.length - 1].id,
+    }));
+  }, [activeSessionByWorkspace, activeWorkspaceId, sessionsByWorkspace]);
 
   useEffect(() => {
     setFileListVisibleCount(20);
@@ -1154,10 +1658,12 @@ export default function AppShell() {
       const repoName = workspace
         ? repos.find((repo) => repo.id === workspace.repoId)?.name ?? 'Repository'
         : 'Workspace';
-      const label = workspace ? `${session.title}` : session.title;
+      const title = session.title ?? 'Chat';
+      const modelLabel = session.model ?? formatAgentLabel(session.agentType);
+      const label = workspace ? `${title}` : title;
       const description = workspace
-        ? `${repoName} · ${workspace.branch} · ${session.model}`
-        : session.model;
+        ? `${repoName} · ${workspace.branch} · ${modelLabel}`
+        : modelLabel;
       items.push({
         id: `session-${session.id}`,
         label,
@@ -1617,6 +2123,8 @@ export default function AppShell() {
               {activeSessions.map((session) => {
                 const isActive =
                   activeTab === 'session' && activeSessionId === session.id;
+                const title = session.title ?? 'Chat';
+                const modelLabel = session.model ?? formatAgentLabel(session.agentType);
                 return (
                   <button
                     key={session.id}
@@ -1634,9 +2142,9 @@ export default function AppShell() {
                         : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
                     }`}
                   >
-                    <span className="truncate">{session.title}</span>
+                    <span className="truncate">{title}</span>
                     <span className="text-[10px] uppercase tracking-widest text-slate-500">
-                      {session.model}
+                      {modelLabel}
                     </span>
                   </button>
                 );
@@ -1653,6 +2161,17 @@ export default function AppShell() {
               >
                 + New chat
               </button>
+              <select
+                aria-label="New chat agent"
+                value={newChatAgentType}
+                onChange={(event) =>
+                  setNewChatAgentType(event.target.value as 'claude' | 'codex')
+                }
+                className="rounded-md border border-slate-800 bg-slate-950 px-2 py-1 text-[11px] uppercase tracking-widest text-slate-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500"
+              >
+                <option value="claude">Claude</option>
+                <option value="codex">Codex</option>
+              </select>
               {activeView !== 'workspace' ? (
                 <div className="ml-3 text-xs uppercase tracking-[0.2em] text-slate-600">
                   {headerTitle}
@@ -1815,13 +2334,101 @@ export default function AppShell() {
                       </div>
                     </div>
                   </div>
+                ) : activeSession ? (
+                  <div className="flex h-full flex-col gap-4">
+                    <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-4">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                            Chat
+                          </div>
+                          <div className="mt-2 text-sm text-slate-200">
+                            {(activeSession.title ?? 'Chat')}{' '}
+                            <span className="text-xs uppercase tracking-widest text-slate-500">
+                              {activeSession.model ?? formatAgentLabel(activeSession.agentType)}
+                            </span>
+                          </div>
+                          <div className="mt-2 text-xs text-slate-500">
+                            Status: {activeSessionStatus}
+                            {activePlanMode ? ' · Plan mode' : ''}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 text-xs text-slate-500">
+                          <span className="rounded-full border border-slate-800 px-2 py-1 uppercase tracking-widest">
+                            {activeSession.agentType}
+                          </span>
+                        </div>
+                      </div>
+                      {activeSessionError ? (
+                        <div className="mt-3 text-sm text-red-400">
+                          {activeSessionError}
+                        </div>
+                      ) : null}
+                      {sendError ? (
+                        <div className="mt-2 text-sm text-amber-400">{sendError}</div>
+                      ) : null}
+                      {sessionListError ? (
+                        <div className="mt-2 text-sm text-amber-400">
+                          {sessionListError}
+                        </div>
+                      ) : null}
+                    </div>
+                    <div className="flex-1 space-y-4 overflow-auto rounded-lg border border-slate-800 bg-slate-950/40 p-4">
+                      {activeSessionMessages.length === 0 ? (
+                        <div className="text-sm text-slate-500">
+                          No messages yet. Start the conversation below.
+                        </div>
+                      ) : (
+                        activeSessionMessages.map((message) => {
+                          const rawToolSummary =
+                            message.metadata &&
+                            typeof message.metadata === 'object' &&
+                            'toolSummary' in message.metadata
+                              ? (message.metadata as Record<string, unknown>)['toolSummary']
+                              : null;
+                          const toolSummary =
+                            rawToolSummary && typeof rawToolSummary === 'object'
+                              ? (rawToolSummary as Record<string, number>)
+                              : null;
+                          return (
+                            <div
+                              key={message.id}
+                              className={`rounded-lg border p-4 ${
+                                message.role === 'user'
+                                  ? 'border-slate-800 bg-slate-900/60'
+                                  : 'border-slate-800 bg-slate-950/70'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between text-[11px] uppercase tracking-widest text-slate-500">
+                                <span>{message.role}</span>
+                                {message.streaming ? (
+                                  <span className="text-emerald-400">Streaming…</span>
+                                ) : null}
+                              </div>
+                              <pre className="mt-2 whitespace-pre-wrap text-sm text-slate-100">
+                                {message.content}
+                              </pre>
+                              {toolSummary ? (
+                                <div className="mt-3 text-xs text-slate-500">
+                                  Tools:{' '}
+                                  {Object.entries(toolSummary)
+                                    .map(([tool, count]) => `${tool} (${count})`)
+                                    .join(', ')}
+                                </div>
+                              ) : null}
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
                 ) : (
                   <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-6">
                     <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
                       Chat
                     </div>
                     <div className="mt-2 text-sm text-slate-400">
-                      Chat sessions render here in a future milestone.
+                      Start a new chat to talk with Claude or Codex.
                     </div>
                   </div>
                 )}
@@ -1858,15 +2465,75 @@ export default function AppShell() {
         <div className="border-t border-slate-800 px-6 py-4">
           <div className="flex items-center justify-between text-xs uppercase tracking-widest text-slate-500">
             <span>Composer</span>
-            <span>{activeWorkspaceId ? 'Ready' : 'Select a workspace to start'}</span>
+            <span>
+              {activeWorkspaceId
+                ? activeSessionStatus === 'running'
+                  ? 'Running'
+                  : 'Ready'
+                : 'Select a workspace to start'}
+            </span>
           </div>
-          <div
-            className={`mt-3 h-12 rounded-md border ${
-              activeWorkspaceId
-                ? 'border-slate-800 bg-slate-900/40'
-                : 'border-slate-900 bg-slate-950/40'
-            }`}
-          />
+          <div className="mt-3 space-y-3">
+            <textarea
+              value={composerValue}
+              onChange={(event) => setComposerValue(event.target.value)}
+              onKeyDown={handleComposerKeyDown}
+              disabled={!activeWorkspaceId}
+              rows={3}
+              placeholder={
+                activeWorkspaceId
+                  ? 'Send a prompt to the agent...'
+                  : 'Select a workspace to start chatting.'
+              }
+              className="w-full resize-none rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 disabled:cursor-not-allowed disabled:text-slate-600"
+            />
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500">
+                {activeSession ? (
+                  <span>
+                    Session:{' '}
+                    <span className="text-slate-200">
+                      {activeSession.title ?? 'Chat'}
+                    </span>
+                  </span>
+                ) : (
+                  <span>
+                    New chat agent:{' '}
+                    <span className="text-slate-200">
+                      {formatAgentLabel(newChatAgentType)}
+                    </span>
+                  </span>
+                )}
+                {activeSession?.agentType === 'claude' ? (
+                  <label className="flex items-center gap-2 text-[11px] uppercase tracking-widest text-slate-500">
+                    Permission
+                    <select
+                      value={activePermissionMode}
+                      onChange={(event) => handlePermissionModeChange(event.target.value)}
+                      className="rounded-md border border-slate-800 bg-slate-950 px-2 py-1 text-[11px] uppercase tracking-widest text-slate-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500"
+                    >
+                      <option value="default">Default</option>
+                      <option value="plan">Plan</option>
+                      <option value="acceptEdits">Accept edits</option>
+                      <option value="bypassPermissions">Bypass</option>
+                      <option value="delegate">Delegate</option>
+                      <option value="dontAsk">Don't ask</option>
+                    </select>
+                  </label>
+                ) : null}
+              </div>
+              <div className="flex items-center gap-2">
+                {canCancelSession ? (
+                  <Button variant="outline" onClick={handleCancelSession}>
+                    Stop
+                  </Button>
+                ) : null}
+                <Button onClick={handleSendMessage} disabled={!canSendMessage}>
+                  {activeSessionStatus === 'running' ? 'Running...' : 'Send'}
+                </Button>
+              </div>
+            </div>
+          </div>
         </div>
       </main>
 
@@ -2187,6 +2854,91 @@ export default function AppShell() {
                 Cancel
               </Button>
               <Button onClick={confirmArchiveWorkspace}>Archive and run script</Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {activeAskRequest ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-6">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="ask-user-title"
+            className="w-full max-w-lg rounded-lg border border-slate-800 bg-slate-950 p-6 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                  Claude needs input
+                </div>
+                <h2 id="ask-user-title" className="mt-2 text-xl font-semibold">
+                  Answer questions
+                </h2>
+              </div>
+            </div>
+
+            <div className="mt-4 space-y-4">
+              {activeAskRequest.questions.map((question, index) => (
+                <div key={`${question.question}-${index}`}>
+                  <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">
+                    Question {index + 1} of {activeAskRequest.questions.length}
+                  </div>
+                  <div className="mt-2 text-sm text-slate-200">{question.question}</div>
+                  <select
+                    value={askAnswers[index] ?? ''}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setAskAnswers((prev) => {
+                        const next = [...prev];
+                        next[index] = value;
+                        return next;
+                      });
+                    }}
+                    className="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500"
+                  >
+                    {question.options.map((option) => (
+                      <option key={option} value={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-6 flex items-center justify-end gap-2">
+              <Button variant="outline" onClick={handleCancelAskUserQuestion}>
+                Cancel
+              </Button>
+              <Button onClick={handleResolveAskUserQuestion}>Send response</Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {activeExitRequest ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-6">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="exit-plan-title"
+            className="w-full max-w-md rounded-lg border border-slate-800 bg-slate-950 p-6 shadow-2xl"
+          >
+            <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+              Plan review
+            </div>
+            <h2 id="exit-plan-title" className="mt-2 text-xl font-semibold">
+              Approve the plan?
+            </h2>
+            <p className="mt-3 text-sm text-slate-400">
+              Claude has finished planning. Approve to continue, or reject to stop.
+            </p>
+            <div className="mt-6 flex items-center justify-end gap-2">
+              <Button variant="outline" onClick={() => handleResolveExitPlanMode(false)}>
+                Reject
+              </Button>
+              <Button onClick={() => handleResolveExitPlanMode(true)}>Approve</Button>
             </div>
           </div>
         </div>
