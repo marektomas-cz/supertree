@@ -9,3 +9,9 @@ export type WorkspaceInfo = {
   unread: boolean;
   basePort?: number | null;
 };
+
+export type FilePreview = {
+  path: string;
+  content: string;
+  truncated: boolean;
+};
