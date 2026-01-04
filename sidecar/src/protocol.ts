@@ -25,19 +25,33 @@ export const FRONTEND_RPC_METHODS = {
 export type AgentType = 'claude' | 'codex' | 'unknown';
 
 export type QueryOptions = {
+  /** Shared: working directory for agent execution. */
   cwd: string;
+  /** Shared: model override if supported by the agent. */
   model?: string;
+  /** Claude-specific: permission mode for Claude CLI. */
   permissionMode?: string;
+  /** Shared: turn id for correlating streamed messages. */
   turnId?: number;
+  /** Shared: resume token for existing agent sessions. */
   resume?: string;
+  /** Shared: resume timestamp for session rehydration. */
   resumeSessionAt?: string;
+  /** Claude-specific: reset streaming generator state. */
   shouldResetGenerator?: boolean;
+  /** Claude-specific: environment variables to set for Claude CLI. */
   claudeEnvVars?: string;
+  /** Claude-specific: additional directories Claude is allowed to access. */
   additionalDirectories?: string[];
+  /** Claude-specific: GitHub token for repository access. */
   ghToken?: string;
+  /** Codex-specific: environment overrides for Codex execution. */
   conductorEnv?: Record<string, string>;
+  /** Codex-specific: OpenAI API key for Codex. */
   codexApiKey?: string;
+  /** Codex-specific: base URL for Codex API. */
   codexBaseUrl?: string;
+  /** Codex-specific: reasoning effort level. */
   codexModelReasoningEffort?: string;
 };
 
@@ -142,6 +156,7 @@ export const isContextUsageRequest = (
   return isString(value.options.cwd) && isString(value.options.claudeSessionId);
 };
 
+// NOTE: Permission mode updates are Claude-only; add a new request/guard for other agents.
 export const isUpdatePermissionModeRequest = (
   value: unknown,
 ): value is UpdatePermissionModeRequest => {

@@ -14,7 +14,10 @@ type CodexSessionState = {
   toolSummary: Record<string, number>;
 };
 
-const isToolItemType = (value: string) => value.includes('tool');
+const TOOL_ITEM_TYPES = ['mcp_tool_call'] as const;
+type ToolItemType = (typeof TOOL_ITEM_TYPES)[number];
+const isToolItemType = (value: string): value is ToolItemType =>
+  (TOOL_ITEM_TYPES as readonly string[]).includes(value);
 
 const isAbortError = (error: unknown) => {
   if (!error) return false;

@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -82,7 +83,7 @@ export const resolveCodexBinaryPath = () => {
     target = arch === 'arm64' ? 'aarch64-unknown-linux-musl' : 'x86_64-unknown-linux-musl';
   }
   const binaryName = platform === 'win32' ? 'codex.exe' : 'codex';
-  return path.join(
+  const binaryPath = path.join(
     sidecarRoot(),
     'node_modules',
     '@openai',
@@ -92,4 +93,10 @@ export const resolveCodexBinaryPath = () => {
     'codex',
     binaryName,
   );
+  if (!fs.existsSync(binaryPath)) {
+    throw new Error(
+      `Codex binary not found at ${binaryPath}. Ensure @openai/codex-sdk is installed.`,
+    );
+  }
+  return binaryPath;
 };

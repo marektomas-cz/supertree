@@ -1151,14 +1151,14 @@ export default function AppShell() {
       });
       const normalized = normalizeSessionMessage(userMessage);
       setMessagesBySession((prev) => {
-        const list = prev[session!.id] ?? [];
-        return { ...prev, [session!.id]: [...list, normalized] };
+        const list = prev[session.id] ?? [];
+        return { ...prev, [session.id]: [...list, normalized] };
       });
       setComposerValue('');
-      setSessionStatuses((prev) => ({ ...prev, [session!.id]: 'running' }));
+      setSessionStatuses((prev) => ({ ...prev, [session.id]: 'running' }));
     } catch (err) {
       setSendError(String(err));
-      setSessionErrors((prev) => ({ ...prev, [session!.id]: String(err) }));
+      setSessionErrors((prev) => ({ ...prev, [session.id]: String(err) }));
     }
   }, [
     activeSession,

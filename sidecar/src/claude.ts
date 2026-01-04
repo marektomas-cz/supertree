@@ -297,6 +297,7 @@ export class ClaudeSessionManager {
   }
 
   async claudeAuth(id: string, cwd: string) {
+    // Create a lightweight query to fetch account info, then interrupt to release resources.
     const queryResult = query({
       prompt: '',
       options: {
@@ -305,14 +306,17 @@ export class ClaudeSessionManager {
         systemPrompt: DEFAULT_PROMPT,
       },
     });
-    const accountInfo = await queryResult.accountInfo();
-    await queryResult.interrupt();
-    return {
-      id,
-      type: 'claude_auth_output',
-      agentType: 'claude' satisfies AgentType,
-      accountInfo,
-    };
+    try {
+      const accountInfo = await queryResult.accountInfo();
+      return {
+        id,
+        type: 'claude_auth_output',
+        agentType: 'claude' satisfies AgentType,
+        accountInfo,
+      };
+    } finally {
+      await queryResult.interrupt();
+    }
   }
 
   async workspaceInit(id: string, options: QueryOptions) {
@@ -351,18 +355,20 @@ export class ClaudeSessionManager {
         settingSources: DEFAULT_SETTING_SOURCES,
       },
     });
-    for await (const message of queryResult) {
-      if (message.type !== 'user') continue;
+    try {
+      for await (const message of queryResult) {
+        if (message.type !== 'user') continue;
+        return {
+          type: 'context_usage',
+          id,
+          agentType: 'claude' satisfies AgentType,
+          contextUsageData: message,
+        };
+      }
+      throw new Error('No context usage response');
+    } finally {
       await queryResult.interrupt();
-      return {
-        type: 'context_usage',
-        id,
-        agentType: 'claude' satisfies AgentType,
-        contextUsageData: message,
-      };
     }
-    await queryResult.interrupt();
-    throw new Error('No context usage response');
   }
 
   private async startStreaming(

@@ -13,6 +13,8 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 type SidecarWriter = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
@@ -37,6 +39,7 @@ struct SidecarSession {
   streaming: Arc<Mutex<StreamingState>>,
   child: Arc<Mutex<Option<Child>>>,
   closing: Arc<AtomicBool>,
+  reader_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 #[derive(Default)]
@@ -308,7 +311,8 @@ impl SidecarManager {
   }
 
   async fn spawn_session(&self, session_id: &str) -> Result<Arc<SidecarSession>, String> {
-    // NOTE: One sidecar process per session (simpler isolation). Resource usage scales linearly.
+    // NOTE: One Node sidecar process + socket reader per session for isolation.
+    // Resource usage (processes/FDs) scales linearly; consider pooling if this becomes hot.
     let (child, socket_path) = spawn_sidecar_process()?;
     let (reader, writer) = connect_socket(&socket_path).await?;
     let session = Arc::new(SidecarSession {
@@ -318,12 +322,18 @@ impl SidecarManager {
       streaming: Arc::new(Mutex::new(StreamingState::default())),
       child: Arc::new(Mutex::new(Some(child))),
       closing: Arc::new(AtomicBool::new(false)),
+      reader_task: Arc::new(Mutex::new(None)),
     });
-    self.spawn_reader(session.clone(), reader);
+    let reader_handle = self.spawn_reader(session.clone(), reader);
+    *session.reader_task.lock().await = Some(reader_handle);
     Ok(session)
   }
 
-  fn spawn_reader(&self, session: Arc<SidecarSession>, reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>) {
+  fn spawn_reader(
+    &self,
+    session: Arc<SidecarSession>,
+    reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+  ) -> JoinHandle<()> {
     let app_handle = self.app_handle.clone();
     let db = self.db.clone();
     let pending_frontend = self.pending_frontend.clone();
@@ -382,7 +392,7 @@ impl SidecarManager {
           },
         );
       }
-    });
+    })
   }
 }
 
@@ -424,12 +434,26 @@ impl SidecarSession {
 
   async fn shutdown(&self) {
     self.closing.store(true, Ordering::SeqCst);
-    let mut guard = self.child.lock().await;
-    if let Some(mut child) = guard.take() {
+    let child = {
+      let mut guard = self.child.lock().await;
+      guard.take()
+    };
+    if let Some(mut child) = child {
       if let Err(err) = child.kill() {
         eprintln!("[sidecar] failed to kill process: {err}");
       } else if let Err(err) = child.wait() {
         eprintln!("[sidecar] failed to wait for process: {err}");
+      }
+    }
+    let reader_handle = {
+      let mut guard = self.reader_task.lock().await;
+      guard.take()
+    };
+    if let Some(handle) = reader_handle {
+      match timeout(Duration::from_secs(2), handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => eprintln!("[sidecar] reader task failed: {err}"),
+        Err(_) => eprintln!("[sidecar] reader task shutdown timed out"),
       }
     }
   }
