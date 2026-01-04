@@ -5,7 +5,7 @@
   "identifier": "com.supertree.app",
   "build": {
     "beforeDevCommand": "node scripts/dev-tauri.mjs",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run sidecar:build && npm run build",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../dist"
   },

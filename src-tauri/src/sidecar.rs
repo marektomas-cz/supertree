@@ -4,6 +4,7 @@ use crate::workspace;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -852,9 +853,48 @@ fn id_to_key(id: &Value) -> String {
   }
 }
 
+fn resolve_node_binary() -> Result<PathBuf, String> {
+  if let Ok(value) = env::var("SUPERTREE_NODE_PATH") {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+      return Err("SUPERTREE_NODE_PATH is set but empty".to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_file() {
+      return Err(format!(
+        "SUPERTREE_NODE_PATH does not point to a file: {}",
+        path.display()
+      ));
+    }
+    return Ok(path);
+  }
+  Ok(PathBuf::from("node"))
+}
+
+fn ensure_node_available(node: &PathBuf) -> Result<(), String> {
+  let output = Command::new(node)
+    .arg("--version")
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .output()
+    .map_err(|_| {
+      "Node.js runtime not found. Install Node.js 20+ or set SUPERTREE_NODE_PATH."
+        .to_string()
+    })?;
+  if !output.status.success() {
+    return Err(
+      "Node.js runtime failed to start. Install Node.js 20+ or set SUPERTREE_NODE_PATH."
+        .to_string(),
+    );
+  }
+  Ok(())
+}
+
 fn spawn_sidecar_process(app_handle: &AppHandle) -> Result<(Child, String), String> {
   let entry = sidecar_entry(app_handle)?;
-  let mut child = Command::new("node")
+  let node = resolve_node_binary()?;
+  ensure_node_available(&node)?;
+  let mut child = Command::new(node)
     .arg(entry)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
@@ -903,7 +943,12 @@ fn sidecar_entry(app_handle: &AppHandle) -> Result<PathBuf, String> {
   let root = manifest_dir
     .parent()
     .ok_or_else(|| "Missing project root".to_string())?;
-  Ok(root.join("sidecar").join("dist").join("index.js"))
+  let dev_path = root.join("sidecar").join("dist").join("index.js");
+  if dev_path.exists() {
+    return Ok(dev_path);
+  }
+  Err("Sidecar bundle not found. Run `npm run sidecar:build` before launching."
+    .to_string())
 }
 
 #[cfg(unix)]
