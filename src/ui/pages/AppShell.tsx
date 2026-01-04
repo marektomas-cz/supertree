@@ -109,6 +109,10 @@ const STORAGE_KEYS = {
   activeSessions: 'supertree.activeSessionsByWorkspace',
 };
 
+const REVIEW_DIFF_MAX_CHARS = 12_000;
+const REVIEW_DIFF_HEAD_CHARS = 7_000;
+const REVIEW_DIFF_TAIL_CHARS = 3_000;
+
 const readBoolean = (key: string, fallback: boolean) => {
   if (typeof window === 'undefined') {
     return fallback;
@@ -145,6 +149,15 @@ const readJson = <T,>(key: string, fallback: T): T => {
   } catch {
     return fallback;
   }
+};
+
+const truncateReviewDiff = (diff: string) => {
+  if (diff.length <= REVIEW_DIFF_MAX_CHARS) {
+    return { text: diff, truncated: false };
+  }
+  const head = diff.slice(0, REVIEW_DIFF_HEAD_CHARS);
+  const tail = diff.slice(-REVIEW_DIFF_TAIL_CHARS);
+  return { text: `${head}\n...[truncated]...\n${tail}`, truncated: true };
 };
 
 const buildFileTree = (files: string[]): FileTreeNode[] => {
@@ -1897,23 +1910,29 @@ export default function AppShell() {
     const permissionMode =
       agentType === 'claude' ? permissionModeBySession[session.id] ?? 'default' : undefined;
     let diffText = '';
+    let diffTruncated = false;
     try {
       const response = await invoke<WorkspaceDiffResponse>('getWorkspaceDiff', {
         workspaceId: activeWorkspaceId,
         path: null,
         stat: false,
       });
-      diffText = response.diff.trim();
+      const trimmed = response.diff.trim();
+      const truncated = truncateReviewDiff(trimmed);
+      diffText = truncated.text;
+      diffTruncated = truncated.truncated;
     } catch (err) {
       setSendError(String(err));
     }
     const thinking = reviewThinkingLevel ?? 'medium';
-    const prompt = [
+    const promptLines = [
       'Review the following git diff and leave concise, actionable feedback.',
       `Thinking level: ${thinking}.`,
       'Output format: Summary, Issues (if any), Suggestions.',
+      diffTruncated ? 'Diff truncated to fit the review prompt.' : null,
       diffText ? '```diff\n' + diffText + '\n```' : 'No changes detected in the workspace.',
-    ].join('\n');
+    ].filter((line): line is string => Boolean(line));
+    const prompt = promptLines.join('\n');
     try {
       setSessionErrors((prev) => ({ ...prev, [session.id]: null }));
       const userMessage = await invoke<SessionMessageRecord>('sendSessionMessage', {

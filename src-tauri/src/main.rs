@@ -3,6 +3,7 @@
 mod db;
 mod git;
 mod attachments;
+mod path_utils;
 mod paths;
 mod repos;
 mod settings;

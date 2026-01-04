@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use crate::path_utils;
 
 /// Parsed scripts configuration from `supertree.json`.
 #[derive(Debug, Clone, Default)]
@@ -387,29 +388,9 @@ fn normalize_diff_path(worktree_path: &Path, file: &Path) -> Result<PathBuf, Git
     let relative = file
       .strip_prefix(worktree_path)
       .map_err(|_| GitError::MissingPath("File is outside workspace".to_string()))?;
-    return normalize_relative_path(relative);
+    return path_utils::normalize_relative_path(relative).map_err(GitError::MissingPath);
   }
-  normalize_relative_path(file)
-}
-
-fn normalize_relative_path(path: &Path) -> Result<PathBuf, GitError> {
-  use std::path::Component;
-  let mut normalized = PathBuf::new();
-  for component in path.components() {
-    match component {
-      Component::CurDir => {}
-      Component::Normal(value) => normalized.push(value),
-      Component::ParentDir => {
-        if !normalized.pop() {
-          return Err(GitError::MissingPath("File is outside workspace".to_string()));
-        }
-      }
-      Component::RootDir | Component::Prefix(_) => {
-        return Err(GitError::MissingPath("Path must be workspace-relative".to_string()));
-      }
-    }
-  }
-  Ok(normalized)
+  path_utils::normalize_relative_path(file).map_err(GitError::MissingPath)
 }
 
 fn collect_numstat(
@@ -430,7 +411,7 @@ fn collect_numstat(
   }
   let arg_refs: Vec<&str> = args.iter().map(|value| value.as_str()).collect();
   let output = run_git(&arg_refs)?;
-  let mut stats = HashMap::new();
+  let mut stats: HashMap<String, (Option<u32>, Option<u32>)> = HashMap::new();
   for line in output.lines() {
     let mut parts = line.split('\t');
     let added_raw = parts.next().unwrap_or_default();
@@ -473,7 +454,8 @@ fn parse_numstat_value(value: &str) -> Option<u32> {
 fn merge_counts(current: Option<u32>, incoming: Option<u32>) -> Option<u32> {
   match (current, incoming) {
     (Some(a), Some(b)) => Some(a.saturating_add(b)),
-    _ => None,
+    (Some(value), None) | (None, Some(value)) => Some(value),
+    (None, None) => None,
   }
 }
 
@@ -482,7 +464,7 @@ fn estimate_untracked_lines(repo_path: &Path, relative: &str) -> Result<Option<u
   if !file_path.is_file() {
     return Ok(None);
   }
-  let mut file = fs::File::open(&file_path).map_err(GitError::Io)?;
+  let file = fs::File::open(&file_path).map_err(GitError::Io)?;
   let mut buffer = Vec::new();
   let mut handle = file.take((MAX_UNTRACKED_SAMPLE_BYTES + 1) as u64);
   handle.read_to_end(&mut buffer).map_err(GitError::Io)?;
