@@ -58,10 +58,17 @@ export default function TerminalPanel({
     instance.terminal.open(container);
     instance.opened = true;
     instance.fit.fit();
-    void invoke('resizeTerminal', {
+    invoke('resizeTerminal', {
       terminalId,
       cols: instance.terminal.cols,
       rows: instance.terminal.rows,
+    }).catch((err) => {
+      console.error('resizeTerminal failed', {
+        terminalId,
+        cols: instance.terminal.cols,
+        rows: instance.terminal.rows,
+        err,
+      });
     });
   }, []);
 
@@ -71,10 +78,17 @@ export default function TerminalPanel({
       return;
     }
     instance.fit.fit();
-    void invoke('resizeTerminal', {
+    invoke('resizeTerminal', {
       terminalId,
       cols: instance.terminal.cols,
       rows: instance.terminal.rows,
+    }).catch((err) => {
+      console.error('resizeTerminal failed', {
+        terminalId,
+        cols: instance.terminal.cols,
+        rows: instance.terminal.rows,
+        err,
+      });
     });
   }, []);
 
@@ -184,27 +198,30 @@ export default function TerminalPanel({
       <div className="flex items-center justify-between">
         <div className="flex flex-wrap gap-2">
           {sessions.map((session) => (
-            <button
+            <div
               key={session.id}
-              type="button"
-              onClick={() => onSelect(session.id)}
               className={`flex items-center gap-2 rounded-md px-2 py-1 text-xs transition ${
                 session.id === activeSessionId
                   ? 'bg-slate-800 text-slate-100'
                   : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
               }`}
             >
-              <span className="truncate">{session.label}</span>
-              <span
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onClose(session.id);
-                }}
+              <button
+                type="button"
+                onClick={() => onSelect(session.id)}
+                className="flex min-w-0 flex-1 items-center gap-2 text-left"
+              >
+                <span className="truncate">{session.label}</span>
+              </button>
+              <button
+                type="button"
+                aria-label={`Close ${session.label}`}
+                onClick={() => onClose(session.id)}
                 className="text-[10px] text-slate-500 hover:text-slate-100"
               >
                 x
-              </span>
-            </button>
+              </button>
+            </div>
           ))}
         </div>
         <Button size="sm" variant="outline" onClick={onCreate}>

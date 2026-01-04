@@ -88,6 +88,7 @@ struct RunManager {
 
 struct RunProcess {
   pid: u32,
+  repo_id: String,
 }
 
 #[derive(Default, Clone)]
@@ -679,13 +680,18 @@ async fn startRunScript(
     workspace_record.base_port,
     &env_vars_raw,
   );
+  let target_repo_id = repo.id.clone();
   if repo.run_script_mode.as_deref() == Some("nonconcurrent") {
     let pids = {
       let guard = run_manager
         .processes
         .lock()
         .map_err(|_| "Run manager lock poisoned".to_string())?;
-      guard.values().map(|process| process.pid).collect::<Vec<_>>()
+      guard
+        .values()
+        .filter(|process| process.repo_id == target_repo_id)
+        .map(|process| process.pid)
+        .collect::<Vec<_>>()
     };
     for pid in pids {
       terminate_process_tree(pid)?;
@@ -705,7 +711,13 @@ async fn startRunScript(
       .processes
       .lock()
       .map_err(|_| "Run manager lock poisoned".to_string())?;
-    guard.insert(workspace_id.clone(), RunProcess { pid });
+    guard.insert(
+      workspace_id.clone(),
+      RunProcess {
+        pid,
+        repo_id: repo.id.clone(),
+      },
+    );
   }
   if let Some(stdout) = child.stdout.take() {
     spawn_run_output_reader(stdout, window.clone(), workspace_id.clone(), "stdout");
@@ -862,9 +874,12 @@ async fn createTerminal(
       .ok_or_else(|| "Terminal session not found".to_string())?
   };
   std::thread::spawn(move || {
-    let _ = {
-      let mut guard = child_handle.lock().unwrap_or_else(|err| err.into_inner());
-      guard.wait().ok()
+    let _ = match child_handle.lock() {
+      Ok(mut guard) => guard.wait().ok(),
+      Err(err) => {
+        eprintln!("[terminal-exit] child lock poisoned: {err}");
+        None
+      }
     };
     if let Ok(mut guard) = terminal_manager.sessions.lock() {
       guard.remove(&terminal_id_exit);
@@ -1293,14 +1308,16 @@ fn default_shell_command() -> (String, Vec<String>) {
 fn configure_process_group(command: &mut Command) {
   #[cfg(unix)]
   {
-    let _ = command.pre_exec(|| {
-      unsafe {
-        if libc::setpgid(0, 0) != 0 {
-          return Err(std::io::Error::last_os_error());
+    unsafe {
+      let _ = command.pre_exec(|| {
+        unsafe {
+          if libc::setpgid(0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+          }
         }
-      }
-      Ok(())
-    });
+        Ok(())
+      });
+    }
   }
   #[cfg(not(unix))]
   {
@@ -1326,10 +1343,20 @@ fn terminate_process_tree(pid: u32) -> Result<(), String> {
   #[cfg(unix)]
   unsafe {
     let pgid = -(pid as i32);
-    if libc::kill(pgid, libc::SIGKILL) != 0 {
+    if libc::kill(pgid, libc::SIGTERM) != 0 {
       let err = std::io::Error::last_os_error();
-      if err.kind() != std::io::ErrorKind::NotFound {
+      if err.raw_os_error() != Some(libc::ESRCH) {
         return Err(format!("Failed to terminate process group for pid {pid}: {err}"));
+      }
+    } else {
+      std::thread::sleep(Duration::from_millis(100));
+      if libc::kill(pgid, libc::SIGKILL) != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+          return Err(format!(
+            "Failed to force terminate process group for pid {pid}: {err}"
+          ));
+        }
       }
     }
   }

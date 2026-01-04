@@ -41,6 +41,7 @@ type TerminalExitEvent = {
 };
 
 type RunOutputEntry = {
+  id: string;
   stream: 'stdout' | 'stderr';
   line: string;
 };
@@ -83,6 +84,18 @@ const readNumber = (key: string, fallback: number) => {
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
+
+const createRunOutputEntry = (
+  stream: RunOutputEntry['stream'],
+  line: string,
+): RunOutputEntry => {
+  const cryptoObj = globalThis.crypto;
+  const id =
+    typeof cryptoObj?.randomUUID === 'function'
+      ? cryptoObj.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return { id, stream, line };
+};
 
 const DIFF_PLACEHOLDER = `diff --git a/src/main.tsx b/src/main.tsx
 index 5b8c3d2..c19b2e1 100644
@@ -431,10 +444,8 @@ export default function AppShell() {
   useEffect(() => {
     const runOutputUnlisten = listen<RunOutputEvent>('run-output', (event) => {
       const { workspaceId, stream, line } = event.payload;
-      const entry: RunOutputEntry = {
-        stream: stream === 'stderr' ? 'stderr' : 'stdout',
-        line,
-      };
+      const normalizedStream = stream === 'stderr' ? 'stderr' : 'stdout';
+      const entry = createRunOutputEntry(normalizedStream, line);
       setRunOutputByWorkspace((prev) => {
         const existing = prev[workspaceId] ?? [];
         const next = [...existing, entry];
@@ -453,7 +464,7 @@ export default function AppShell() {
           code === 0
             ? 'Run completed successfully.'
             : `Run exited with code ${code ?? 'unknown'}.`;
-        const entry: RunOutputEntry = { stream: 'stdout', line };
+        const entry = createRunOutputEntry('stdout', line);
         const next = [...existing, entry];
         if (next.length > RUN_OUTPUT_LIMIT) {
           next.splice(0, next.length - RUN_OUTPUT_LIMIT);
@@ -465,9 +476,10 @@ export default function AppShell() {
       'terminal-exit',
       (event) => {
         const { terminalId } = event.payload;
+        let affectedWorkspace: string | null = null;
+        let remainingSessions: TerminalSession[] = [];
         setTerminalSessionsByWorkspace((prev) => {
           const next = { ...prev };
-          let affectedWorkspace: string | null = null;
           for (const [workspaceId, sessions] of Object.entries(prev)) {
             if (!sessions.some((session) => session.id === terminalId)) {
               continue;
@@ -477,18 +489,22 @@ export default function AppShell() {
             );
             affectedWorkspace = workspaceId;
           }
-          if (affectedWorkspace) {
-            setActiveTerminalByWorkspace((activePrev) => {
-              const updated = { ...activePrev };
-              const remaining = next[affectedWorkspace] ?? [];
-              if (activePrev[affectedWorkspace] === terminalId) {
-                updated[affectedWorkspace] = remaining[0]?.id ?? null;
-              }
-              return updated;
-            });
-          }
+          remainingSessions = affectedWorkspace ? next[affectedWorkspace] ?? [] : [];
           return next;
         });
+        if (affectedWorkspace) {
+          const workspaceId = affectedWorkspace;
+          const remaining = remainingSessions;
+          setActiveTerminalByWorkspace((activePrev) => {
+            if (activePrev[workspaceId] !== terminalId) {
+              return activePrev;
+            }
+            return {
+              ...activePrev,
+              [workspaceId]: remaining[0]?.id ?? null,
+            };
+          });
+        }
       },
     );
     return () => {
@@ -944,10 +960,10 @@ export default function AppShell() {
     }));
     setRunOutputByWorkspace((prev) => {
       const existing = prev[activeWorkspaceId] ?? [];
-      const entry: RunOutputEntry = {
-        stream: 'stdout',
-        line: 'Starting run script...',
-      };
+      const entry = createRunOutputEntry(
+        'stdout',
+        'Starting run script...',
+      );
       const next = [...existing, entry];
       return { ...prev, [activeWorkspaceId]: next };
     });
@@ -2039,9 +2055,9 @@ export default function AppShell() {
                         </div>
                       ) : (
                         <div className="space-y-1 font-mono">
-                          {activeRunOutput.map((entry, index) => (
+                          {activeRunOutput.map((entry) => (
                             <div
-                              key={`${index}-${entry.line}`}
+                              key={entry.id}
                               className={
                                 entry.stream === 'stderr'
                                   ? 'text-amber-300'
