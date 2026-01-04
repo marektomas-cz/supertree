@@ -336,24 +336,30 @@ export default function AppShell() {
   }, [loadWorkspaces]);
 
   useEffect(() => {
-    window.localStorage.setItem(STORAGE_KEYS.leftVisible, String(leftSidebarVisible));
-  }, [leftSidebarVisible]);
-
-  useEffect(() => {
-    window.localStorage.setItem(STORAGE_KEYS.rightVisible, String(rightSidebarVisible));
-  }, [rightSidebarVisible]);
-
-  useEffect(() => {
+    window.localStorage.setItem(
+      STORAGE_KEYS.leftVisible,
+      String(leftSidebarVisible),
+    );
+    window.localStorage.setItem(
+      STORAGE_KEYS.rightVisible,
+      String(rightSidebarVisible),
+    );
     window.localStorage.setItem(STORAGE_KEYS.zenMode, String(zenMode));
-  }, [zenMode]);
-
-  useEffect(() => {
-    window.localStorage.setItem(STORAGE_KEYS.leftWidth, String(leftSidebarWidth));
-  }, [leftSidebarWidth]);
-
-  useEffect(() => {
-    window.localStorage.setItem(STORAGE_KEYS.rightWidth, String(rightSidebarWidth));
-  }, [rightSidebarWidth]);
+    window.localStorage.setItem(
+      STORAGE_KEYS.leftWidth,
+      String(leftSidebarWidth),
+    );
+    window.localStorage.setItem(
+      STORAGE_KEYS.rightWidth,
+      String(rightSidebarWidth),
+    );
+  }, [
+    leftSidebarVisible,
+    rightSidebarVisible,
+    zenMode,
+    leftSidebarWidth,
+    rightSidebarWidth,
+  ]);
 
   useEffect(() => {
     const handleMove = (event: MouseEvent) => {
@@ -1476,7 +1482,11 @@ export default function AppShell() {
                         {filePreview ? (
                           <div className="mt-1 text-xs text-slate-500">
                             {filePreview.path}
-                            {filePreview.truncated ? ' (truncated)' : ''}
+                            {filePreview.binary
+                              ? ' (binary)'
+                              : filePreview.truncated
+                                ? ' (truncated)'
+                                : ''}
                           </div>
                         ) : (
                           <div className="mt-1 text-xs text-slate-500">
@@ -1486,16 +1496,22 @@ export default function AppShell() {
                       </div>
                       <div className="max-h-[360px] overflow-auto px-4 py-3 text-xs text-slate-200">
                         {filePreview ? (
-                          <>
-                            <pre className="whitespace-pre-wrap">
-                              {filePreview.content}
-                            </pre>
-                            {filePreview.truncated ? (
-                              <div className="mt-3 text-xs text-amber-400">
-                                Preview truncated. Open the file in an editor for the full content.
-                              </div>
-                            ) : null}
-                          </>
+                          filePreview.binary ? (
+                            <div className="text-sm text-slate-500">
+                              Binary file preview is not available.
+                            </div>
+                          ) : (
+                            <>
+                              <pre className="whitespace-pre-wrap">
+                                {filePreview.content}
+                              </pre>
+                              {filePreview.truncated ? (
+                                <div className="mt-3 text-xs text-amber-400">
+                                  Preview truncated. Open the file in an editor for the full content.
+                                </div>
+                              ) : null}
+                            </>
+                          )
                         ) : (
                           <div className="text-sm text-slate-500">
                             Use {isMac ? 'Cmd+P' : 'Ctrl+P'} to open a file.

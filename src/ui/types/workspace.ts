@@ -14,4 +14,5 @@ export type FilePreview = {
   path: string;
   content: string;
   truncated: boolean;
+  binary: boolean;
 };

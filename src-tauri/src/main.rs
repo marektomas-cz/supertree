@@ -43,6 +43,7 @@ struct FilePreview {
   path: String,
   content: String,
   truncated: bool,
+  binary: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -634,6 +635,10 @@ fn should_skip_dir(path: &Path) -> bool {
   )
 }
 
+fn is_likely_binary(buffer: &[u8]) -> bool {
+  buffer.iter().take(8_000).any(|&byte| byte == 0)
+}
+
 fn list_workspace_files(root: &Path) -> Result<Vec<String>, String> {
   let mut results = Vec::new();
   let mut stack = vec![root.to_path_buf()];
@@ -702,7 +707,12 @@ fn read_workspace_file(root: &Path, relative_path: &str) -> Result<FilePreview, 
   if truncated {
     buffer.truncate(MAX_FILE_PREVIEW_BYTES);
   }
-  let content = String::from_utf8_lossy(&buffer).to_string();
+  let binary = is_likely_binary(&buffer);
+  let content = if binary {
+    String::new()
+  } else {
+    String::from_utf8_lossy(&buffer).to_string()
+  };
   let relative = resolved
     .strip_prefix(root)
     .map_err(|err| err.to_string())?
@@ -711,7 +721,8 @@ fn read_workspace_file(root: &Path, relative_path: &str) -> Result<FilePreview, 
   Ok(FilePreview {
     path: relative,
     content,
-    truncated,
+    truncated: truncated && !binary,
+    binary,
   })
 }
 
