@@ -89,6 +89,8 @@ pub fn create_checkpoint(
     &index_env,
     None,
   )?;
+  // Capture the full working tree (tracked + untracked, excluding .gitignored files).
+  // Keep .gitignore up to date to avoid accidentally snapshotting sensitive local files.
   run_git(repo_path, &["add", "-A", "--", "."], &index_env, None)?;
   let worktree_tree = run_git(repo_path, &["write-tree"], &index_env, None)?;
 
