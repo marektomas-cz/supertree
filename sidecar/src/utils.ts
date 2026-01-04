@@ -29,14 +29,34 @@ export const parseEnvString = (envString: string): ParsedEnv => {
     let value = line.substring(equalsIndex + 1).trim();
     if ((value.startsWith('"') || value.startsWith("'")) && value.length > 1) {
       const quote = value[0];
-      let endQuote = value.indexOf(quote, 1);
+      const findClosingQuote = (text: string) => {
+        let escaped = false;
+        for (let i = 1; i < text.length; i += 1) {
+          const char = text[i];
+          if (escaped) {
+            escaped = false;
+            continue;
+          }
+          if (char === '\\') {
+            escaped = true;
+            continue;
+          }
+          if (char === quote) {
+            return i;
+          }
+        }
+        return -1;
+      };
+      let endQuote = findClosingQuote(value);
       while (endQuote === -1 && index + 1 < lines.length) {
         index += 1;
         value += `\n${lines[index]}`;
-        endQuote = value.indexOf(quote, 1);
+        endQuote = findClosingQuote(value);
       }
       if (endQuote !== -1) {
-        value = value.substring(1, endQuote);
+        const extracted = value.substring(1, endQuote);
+        const unescaped = extracted.replaceAll(`\\${quote}`, quote).replaceAll('\\\\', '\\');
+        value = unescaped;
       }
     }
     result[key] = value;

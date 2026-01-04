@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -15,6 +16,7 @@ use tokio::sync::{Mutex, oneshot};
 
 type SidecarWriter = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
+const SOCKET_PATH_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Clone)]
 pub struct SidecarManager {
@@ -34,6 +36,7 @@ struct SidecarSession {
   pending: Arc<Mutex<HashMap<String, PendingResponse>>>,
   streaming: Arc<Mutex<StreamingState>>,
   child: Arc<Mutex<Option<Child>>>,
+  closing: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -280,6 +283,16 @@ impl SidecarManager {
     }
   }
 
+  pub async fn shutdown_all(&self) {
+    let sessions = {
+      let guard = self.sessions.lock().await;
+      guard.values().cloned().collect::<Vec<_>>()
+    };
+    for session in sessions {
+      session.shutdown().await;
+    }
+  }
+
   async fn ensure_session(&self, session_id: &str) -> Result<Arc<SidecarSession>, String> {
     let existing = {
       let guard = self.sessions.lock().await;
@@ -295,6 +308,7 @@ impl SidecarManager {
   }
 
   async fn spawn_session(&self, session_id: &str) -> Result<Arc<SidecarSession>, String> {
+    // NOTE: One sidecar process per session (simpler isolation). Resource usage scales linearly.
     let (child, socket_path) = spawn_sidecar_process()?;
     let (reader, writer) = connect_socket(&socket_path).await?;
     let session = Arc::new(SidecarSession {
@@ -303,6 +317,7 @@ impl SidecarManager {
       pending: Arc::new(Mutex::new(HashMap::new())),
       streaming: Arc::new(Mutex::new(StreamingState::default())),
       child: Arc::new(Mutex::new(Some(child))),
+      closing: Arc::new(AtomicBool::new(false)),
     });
     self.spawn_reader(session.clone(), reader);
     Ok(session)
@@ -346,15 +361,27 @@ impl SidecarManager {
           eprintln!("[sidecar] payload handling error: {err}");
         }
       }
+      let closing = session.closing.load(Ordering::SeqCst);
       sessions_map.lock().await.remove(&session.session_id);
-      let _ = sessions::set_session_status(db.pool(), &session.session_id, "error").await;
-      let _ = app_handle.emit(
-        "session-error",
-        SessionErrorEvent {
-          session_id: session.session_id.clone(),
-          error: "Sidecar disconnected".to_string(),
-        },
-      );
+      if closing {
+        let _ = sessions::set_session_status(db.pool(), &session.session_id, "idle").await;
+        let _ = app_handle.emit(
+          "session-status",
+          SessionStatusEvent {
+            session_id: session.session_id.clone(),
+            status: "idle".to_string(),
+          },
+        );
+      } else {
+        let _ = sessions::set_session_status(db.pool(), &session.session_id, "error").await;
+        let _ = app_handle.emit(
+          "session-error",
+          SessionErrorEvent {
+            session_id: session.session_id.clone(),
+            error: "Sidecar disconnected".to_string(),
+          },
+        );
+      }
     });
   }
 }
@@ -396,6 +423,7 @@ impl SidecarSession {
   }
 
   async fn shutdown(&self) {
+    self.closing.store(true, Ordering::SeqCst);
     let mut guard = self.child.lock().await;
     if let Some(mut child) = guard.take() {
       if let Err(err) = child.kill() {
@@ -658,11 +686,15 @@ async fn handle_sidecar_message(
 }
 
 async fn handle_sidecar_error(
-  _session: &SidecarSession,
+  session: &SidecarSession,
   payload: SidecarErrorPayload,
   app_handle: &AppHandle,
   db: &Database,
 ) -> Result<(), String> {
+  let turn_id = {
+    let state = session.streaming.lock().await;
+    state.current_turn_id.unwrap_or(-1)
+  };
   let message_id = sessions::generate_message_id(db.pool())
     .await
     .map_err(|err| err.to_string())?;
@@ -676,7 +708,7 @@ async fn handle_sidecar_error(
     sessions::NewSessionMessage {
       id: message_id.clone(),
       session_id: payload.id.clone(),
-      turn_id: 0,
+      turn_id,
       role: "system".to_string(),
       content: payload.error.clone(),
       metadata_json: Some(metadata.to_string()),
@@ -728,12 +760,14 @@ async fn get_diff_response(db: &Database, payload: &GetDiffPayload) -> Result<Va
     if let Some(file) = file.as_ref() {
       let candidate = PathBuf::from(file);
       if candidate.is_absolute() {
-        if !candidate.starts_with(&workspace_path) {
-          return Err("File is outside workspace".to_string());
-        }
-        command.arg("--").arg(candidate);
+        let relative = candidate
+          .strip_prefix(&workspace_path)
+          .map_err(|_| "File is outside workspace".to_string())?;
+        let normalized = normalize_relative_path(relative)?;
+        command.arg("--").arg(normalized);
       } else {
-        command.arg("--").arg(candidate);
+        let normalized = normalize_relative_path(&candidate)?;
+        command.arg("--").arg(normalized);
       }
     }
     let output = command.output().map_err(|err| err.to_string())?;
@@ -747,6 +781,26 @@ async fn get_diff_response(db: &Database, payload: &GetDiffPayload) -> Result<Va
   .map_err(|err| err.to_string())??;
 
   Ok(json!({ "diff": diff }))
+}
+
+fn normalize_relative_path(path: &std::path::Path) -> Result<PathBuf, String> {
+  use std::path::Component;
+  let mut normalized = PathBuf::new();
+  for component in path.components() {
+    match component {
+      Component::CurDir => {}
+      Component::Normal(value) => normalized.push(value),
+      Component::ParentDir => {
+        if !normalized.pop() {
+          return Err("File is outside workspace".to_string());
+        }
+      }
+      Component::RootDir | Component::Prefix(_) => {
+        return Err("Path must be workspace-relative".to_string());
+      }
+    }
+  }
+  Ok(normalized)
 }
 
 fn id_to_key(id: &Value) -> String {
@@ -789,7 +843,7 @@ fn spawn_sidecar_process() -> Result<(Child, String), String> {
   });
 
   let socket_path = rx
-    .recv_timeout(Duration::from_secs(10))
+    .recv_timeout(Duration::from_secs(SOCKET_PATH_TIMEOUT_SECS))
     .map_err(|_| "Sidecar socket path timeout".to_string())?;
 
   Ok((child, socket_path))
@@ -819,10 +873,30 @@ async fn connect_socket(
 async fn connect_socket(
   socket_path: &str,
 ) -> Result<(Box<dyn tokio::io::AsyncRead + Send + Unpin>, SidecarWriter), String> {
+  use std::io::ErrorKind;
   use tokio::net::windows::named_pipe::ClientOptions;
-  let client = ClientOptions::new()
-    .open(socket_path)
-    .map_err(|err| err.to_string())?;
-  let (reader, writer) = tokio::io::split(client);
-  Ok((Box::new(reader), Box::new(writer)))
+  use tokio::time::{sleep, Instant};
+
+  let deadline = Instant::now() + Duration::from_secs(SOCKET_PATH_TIMEOUT_SECS);
+  loop {
+    let path = socket_path.to_string();
+    let attempt = tokio::task::spawn_blocking(move || ClientOptions::new().open(&path))
+      .await
+      .map_err(|err| err.to_string())?;
+    match attempt {
+      Ok(client) => {
+        let (reader, writer) = tokio::io::split(client);
+        return Ok((Box::new(reader), Box::new(writer)));
+      }
+      Err(err) => {
+        let retry = matches!(err.kind(), ErrorKind::NotFound | ErrorKind::WouldBlock)
+          || err.raw_os_error() == Some(231);
+        if retry && Instant::now() < deadline {
+          sleep(Duration::from_millis(200)).await;
+          continue;
+        }
+        return Err(err.to_string());
+      }
+    }
+  }
 }

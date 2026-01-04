@@ -79,6 +79,7 @@ export type ContextUsageRequest = {
 export type UpdatePermissionModeRequest = {
   type: 'update_permission_mode';
   id: string;
+  // Claude-only for now; Codex does not accept permission mode updates.
   agentType: 'claude';
   permissionMode: string;
 };

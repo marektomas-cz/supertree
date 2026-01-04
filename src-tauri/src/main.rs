@@ -634,13 +634,9 @@ async fn createSession(
     .await
     .map_err(|err| err.to_string())?;
 
-  let count: i64 = sqlx::query_scalar(
-    "SELECT COUNT(*) FROM sessions WHERE workspace_id = ?",
-  )
-  .bind(&payload.workspace_id)
-  .fetch_one(db.pool())
-  .await
-  .map_err(|err| err.to_string())?;
+  let count = sessions::count_workspace_sessions(db.pool(), &payload.workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
   let title = Some(format!("Chat {}", count + 1));
 
   sessions::insert_session(
@@ -702,19 +698,15 @@ async fn sendSessionMessage(
     .await
     .map_err(|err| err.to_string())?;
 
-  let turn_id = sessions::next_turn_id(db.pool(), &session.id)
-    .await
-    .map_err(|err| err.to_string())?;
   let message_id = sessions::generate_message_id(db.pool())
     .await
     .map_err(|err| err.to_string())?;
 
-  let user_message = sessions::insert_session_message(
+  let user_message = sessions::insert_session_message_with_next_turn(
     db.pool(),
-    sessions::NewSessionMessage {
+    sessions::NewSessionMessageDraft {
       id: message_id,
       session_id: session.id.clone(),
-      turn_id,
       role: "user".to_string(),
       content: prompt.to_string(),
       metadata_json: None,
@@ -722,10 +714,7 @@ async fn sendSessionMessage(
   )
   .await
   .map_err(|err| err.to_string())?;
-
-  sessions::set_session_status(db.pool(), &session.id, "running")
-    .await
-    .map_err(|err| err.to_string())?;
+  let turn_id = user_message.turn_id;
 
   let mut options = serde_json::Map::new();
   options.insert("cwd".to_string(), Value::String(workspace_record.path));
@@ -783,9 +772,16 @@ async fn sendSessionMessage(
   }
   options.insert("turnId".to_string(), json!(turn_id));
   let options = Value::Object(options);
-  sidecar
+  if let Err(err) = sidecar
     .send_query(&session.id, &session.agent_type, prompt, options, turn_id)
-    .await?;
+    .await
+  {
+    let _ = sessions::set_session_status(db.pool(), &session.id, "error").await;
+    return Err(err);
+  }
+  sessions::set_session_status(db.pool(), &session.id, "running")
+    .await
+    .map_err(|err| err.to_string())?;
 
   Ok(user_message)
 }
@@ -1677,6 +1673,14 @@ fn main() {
       app.manage(TerminalManager::default());
       app.manage(sidecar_manager);
       Ok(())
+    })
+    .on_window_event(|window, event| {
+      if let tauri::WindowEvent::CloseRequested { .. } = event {
+        let sidecar = window.app_handle().state::<SidecarManager>().inner().clone();
+        tauri::async_runtime::spawn(async move {
+          sidecar.shutdown_all().await;
+        });
+      }
     })
     .invoke_handler(tauri::generate_handler![
       hello,

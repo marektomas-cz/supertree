@@ -24,6 +24,8 @@ type JsonRpcResponse = {
 
 type RpcHandler = (params: unknown) => Promise<unknown> | unknown;
 
+const REQUEST_TIMEOUT_MS = 30_000;
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
 
@@ -38,7 +40,10 @@ const safeJsonParse = (text: string): unknown => {
 export class JsonRpcPeer {
   private readonly socket: net.Socket;
   private readonly methods = new Map<string, RpcHandler>();
-  private readonly pending = new Map<JsonRpcId, { resolve: (value: unknown) => void; reject: (err: Error) => void }>();
+  private readonly pending = new Map<
+    JsonRpcId,
+    { resolve: (value: unknown) => void; reject: (err: Error) => void; timeout: ReturnType<typeof setTimeout> }
+  >();
   private nextId = 1;
 
   constructor(socket: net.Socket) {
@@ -57,14 +62,21 @@ export class JsonRpcPeer {
   request(method: string, params?: unknown): Promise<unknown> {
     const id = this.nextId++;
     const payload: JsonRpcRequest = { jsonrpc: '2.0', id, method, params };
-    this.send(payload);
+    if (!this.send(payload)) {
+      return Promise.reject(new Error('Failed to send JSON-RPC request'));
+    }
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`JSON-RPC request timed out after ${REQUEST_TIMEOUT_MS}ms`));
+      }, REQUEST_TIMEOUT_MS);
+      this.pending.set(id, { resolve, reject, timeout });
     });
   }
 
   stop() {
     for (const pending of this.pending.values()) {
+      clearTimeout(pending.timeout);
       pending.reject(new Error('JSON-RPC peer stopped'));
     }
     this.pending.clear();
@@ -98,6 +110,10 @@ export class JsonRpcPeer {
       }
       const id = payload.id;
       if (id !== undefined) {
+        if (typeof id !== 'string' && typeof id !== 'number') {
+          console.error('[JsonRpcPeer] JSON-RPC id missing or invalid:', payload);
+          return;
+        }
         void this.handleRequest(method, id as JsonRpcId, payload.params);
       } else {
         void this.handleNotification(method, payload.params);
@@ -155,6 +171,7 @@ export class JsonRpcPeer {
       console.warn('[JsonRpcPeer] Response without pending request:', response.id);
       return;
     }
+    clearTimeout(pending.timeout);
     this.pending.delete(response.id);
     if (response.error) {
       pending.reject(new Error(response.error.message));
@@ -166,8 +183,10 @@ export class JsonRpcPeer {
   private send(payload: JsonRpcRequest | JsonRpcResponse) {
     try {
       this.socket.write(`${JSON.stringify(payload)}\n`);
+      return true;
     } catch (error) {
       console.error('[JsonRpcPeer] Failed to send payload:', error);
+      return false;
     }
   }
 }

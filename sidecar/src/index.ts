@@ -82,7 +82,16 @@ class SidecarServer {
     rpc.addMethod(SIDECAR_NOTIFICATIONS.QUERY, async (params) => {
       if (!isQueryRequest(params)) return;
       if (params.agentType === 'codex') {
-        void this.codexManager.handleQuery(params.id, params.prompt, params.options, frontend);
+        this.codexManager
+          .handleQuery(params.id, params.prompt, params.options, frontend)
+          .catch((error) => {
+            frontend.sendError({
+              id: params.id,
+              type: 'error',
+              agentType: 'codex',
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
       } else {
         await this.claudeManager.handleQuery(params.id, params.prompt, params.options, frontend);
       }

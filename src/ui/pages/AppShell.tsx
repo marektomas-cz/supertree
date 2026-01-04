@@ -209,6 +209,8 @@ export default function AppShell() {
   );
   const [archiveConfirmScript, setArchiveConfirmScript] = useState<string | null>(null);
   const archiveConfirmRef = useRef<HTMLDivElement>(null);
+  const askUserRef = useRef<HTMLDivElement>(null);
+  const exitPlanRef = useRef<HTMLDivElement>(null);
   const [leftSidebarVisible, setLeftSidebarVisible] = useState(() =>
     readBoolean(STORAGE_KEYS.leftVisible, true),
   );
@@ -246,9 +248,9 @@ export default function AppShell() {
   const [sessionErrors, setSessionErrors] = useState<
     Record<string, string | null>
   >({});
-  const [sessionStatuses, setSessionStatuses] = useState<Record<string, string>>(
-    {},
-  );
+  const [sessionStatuses, setSessionStatuses] = useState<
+    Record<string, SessionRecord['status']>
+  >({});
   const [planModeBySession, setPlanModeBySession] = useState<
     Record<string, boolean>
   >({});
@@ -496,7 +498,7 @@ export default function AppShell() {
       }
       setSessionsByWorkspace(grouped);
       setSessionStatuses(() => {
-        const next: Record<string, string> = {};
+        const next: Record<string, SessionRecord['status']> = {};
         for (const session of data) {
           next[session.id] = session.status;
         }
@@ -783,7 +785,6 @@ export default function AppShell() {
         const payload = event.payload as AskUserQuestionEvent | ExitPlanModeEvent;
         if ('questions' in payload) {
           setPendingAskQueue((prev) => [...prev, payload]);
-          setAskAnswers(payload.questions.map((question) => question.options[0] ?? ''));
         } else {
           setPendingExitQueue((prev) => [...prev, payload]);
         }
@@ -1068,6 +1069,12 @@ export default function AppShell() {
       const remaining = (sessionsByWorkspace[workspaceId] ?? []).filter(
         (session) => session.id !== sessionId,
       );
+      try {
+        await invoke('deleteSession', { sessionId });
+      } catch (err) {
+        setSessionErrors((prev) => ({ ...prev, [sessionId]: String(err) }));
+        return;
+      }
       setSessionsByWorkspace((prev) => ({ ...prev, [workspaceId]: remaining }));
       setMessagesBySession((prev) => {
         const next = { ...prev };
@@ -1094,11 +1101,6 @@ export default function AppShell() {
         delete next[sessionId];
         return next;
       });
-      try {
-        await invoke('deleteSession', { sessionId });
-      } catch (err) {
-        setSessionErrors((prev) => ({ ...prev, [sessionId]: String(err) }));
-      }
       if (isClosingActive) {
         const nextActive = remaining.length > 0 ? remaining[remaining.length - 1].id : null;
         setActiveSessionByWorkspace((prev) => ({ ...prev, [workspaceId]: nextActive }));
@@ -1851,6 +1853,108 @@ export default function AppShell() {
       document.removeEventListener('keydown', handleKeyDown);
     };
   }, [archiveConfirmOpen, closeArchiveConfirm]);
+
+  useEffect(() => {
+    if (!activeAskRequest) {
+      return;
+    }
+    const modal = askUserRef.current;
+    if (!modal) {
+      return;
+    }
+
+    const getFocusable = () =>
+      Array.from(
+        modal.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hasAttribute('disabled'));
+
+    const focusables = getFocusable();
+    if (focusables.length > 0) {
+      focusables[0].focus();
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        void handleCancelAskUserQuestion();
+        return;
+      }
+      if (event.key !== 'Tab') {
+        return;
+      }
+      const items = getFocusable();
+      if (items.length === 0) {
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [activeAskRequest, handleCancelAskUserQuestion]);
+
+  useEffect(() => {
+    if (!activeExitRequest) {
+      return;
+    }
+    const modal = exitPlanRef.current;
+    if (!modal) {
+      return;
+    }
+
+    const getFocusable = () =>
+      Array.from(
+        modal.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hasAttribute('disabled'));
+
+    const focusables = getFocusable();
+    if (focusables.length > 0) {
+      focusables[0].focus();
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        void handleResolveExitPlanMode(false);
+        return;
+      }
+      if (event.key !== 'Tab') {
+        return;
+      }
+      const items = getFocusable();
+      if (items.length === 0) {
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [activeExitRequest, handleResolveExitPlanMode]);
 
   useEffect(() => {
     if (!workspaceMenuId) {
@@ -2862,6 +2966,7 @@ export default function AppShell() {
       {activeAskRequest ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-6">
           <div
+            ref={askUserRef}
             role="dialog"
             aria-modal="true"
             aria-labelledby="ask-user-title"
@@ -2920,6 +3025,7 @@ export default function AppShell() {
       {activeExitRequest ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-6">
           <div
+            ref={exitPlanRef}
             role="dialog"
             aria-modal="true"
             aria-labelledby="exit-plan-title"

@@ -28,6 +28,15 @@ pub struct NewSession {
   pub status: String,
 }
 
+/// Data required to insert a new session message without a turn id.
+pub struct NewSessionMessageDraft {
+  pub id: String,
+  pub session_id: String,
+  pub role: String,
+  pub content: String,
+  pub metadata_json: Option<String>,
+}
+
 /// Session message record stored in SQLite.
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -65,9 +74,7 @@ pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<SessionRecord>, DbEr
 }
 
 pub async fn insert_session(pool: &SqlitePool, new_session: NewSession) -> Result<SessionRecord, DbError> {
-  let id: String = sqlx::query_scalar("SELECT lower(hex(randomblob(16)))")
-    .fetch_one(pool)
-    .await?;
+  let id = generate_random_id(pool).await?;
 
   sqlx::query(
     "INSERT INTO sessions
@@ -186,14 +193,33 @@ pub async fn list_session_messages(
   Ok(rows)
 }
 
-pub async fn next_turn_id(pool: &SqlitePool, session_id: &str) -> Result<i64, DbError> {
+pub async fn insert_session_message_with_next_turn(
+  pool: &SqlitePool,
+  message: NewSessionMessageDraft,
+) -> Result<SessionMessageRecord, DbError> {
+  let mut tx = pool.begin().await?;
   let next: i64 = sqlx::query_scalar(
     "SELECT COALESCE(MAX(turn_id), 0) + 1 FROM session_messages WHERE session_id = ?",
   )
-  .bind(session_id)
-  .fetch_one(pool)
+  .bind(&message.session_id)
+  .fetch_one(&mut *tx)
   .await?;
-  Ok(next)
+  sqlx::query(
+    "INSERT INTO session_messages
+      (id, session_id, turn_id, role, content, sent_at, metadata_json)
+     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)",
+  )
+  .bind(&message.id)
+  .bind(&message.session_id)
+  .bind(next)
+  .bind(&message.role)
+  .bind(&message.content)
+  .bind(&message.metadata_json)
+  .execute(&mut *tx)
+  .await?;
+  tx.commit().await?;
+
+  get_session_message(pool, &message.id).await
 }
 
 pub async fn insert_session_message(
@@ -246,6 +272,7 @@ pub async fn set_session_message_cancelled(
   pool: &SqlitePool,
   message_id: &str,
 ) -> Result<(), DbError> {
+  // TODO: Wire this into cancel flow once we track the active assistant message id.
   let result = sqlx::query(
     "UPDATE session_messages
      SET cancelled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
@@ -263,10 +290,7 @@ pub async fn set_session_message_cancelled(
 }
 
 pub async fn generate_message_id(pool: &SqlitePool) -> Result<String, DbError> {
-  let id: String = sqlx::query_scalar("SELECT lower(hex(randomblob(16)))")
-    .fetch_one(pool)
-    .await?;
-  Ok(id)
+  generate_random_id(pool).await
 }
 
 async fn get_session_message(
@@ -282,4 +306,22 @@ async fn get_session_message(
   .fetch_optional(pool)
   .await?;
   row.ok_or_else(|| DbError::NotFound(format!("Session message not found: {message_id}")))
+}
+
+pub async fn count_workspace_sessions(
+  pool: &SqlitePool,
+  workspace_id: &str,
+) -> Result<i64, DbError> {
+  let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE workspace_id = ?")
+    .bind(workspace_id)
+    .fetch_one(pool)
+    .await?;
+  Ok(count)
+}
+
+async fn generate_random_id(pool: &SqlitePool) -> Result<String, DbError> {
+  let id: String = sqlx::query_scalar("SELECT lower(hex(randomblob(16)))")
+    .fetch_one(pool)
+    .await?;
+  Ok(id)
 }

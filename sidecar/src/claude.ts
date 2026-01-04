@@ -61,6 +61,9 @@ const settingsChanged = (
   const oldEnv = previous.claudeEnvVars ?? '';
   const newEnv = next.claudeEnvVars ?? '';
   if (oldEnv !== newEnv) return true;
+  const oldToken = previous.ghToken ?? '';
+  const newToken = next.ghToken ?? '';
+  if (oldToken !== newToken) return true;
   const oldDirs = previous.additionalDirectories ?? [];
   const newDirs = next.additionalDirectories ?? [];
   if (oldDirs.length !== newDirs.length) return true;
@@ -241,15 +244,23 @@ export class ClaudeSessionManager {
         lastAssistantText: '',
       };
       this.sessions.set(sessionId, session);
-      session.streaming = this.startStreaming(sessionId, session, options, frontend);
     } else if (session.query && options.permissionMode) {
       void session.query.setPermissionMode(normalizePermissionMode(options.permissionMode));
     }
 
-    if (!session?.sendMessage) {
+    if (!session.sendMessage) {
       session.streaming = this.startStreaming(sessionId, session, options, frontend);
     }
-    session?.sendMessage?.(prompt);
+    if (!session.sendMessage) {
+      frontend.sendError({
+        id: sessionId,
+        type: 'error',
+        error: 'Claude session not ready to send messages',
+        agentType: 'claude' satisfies AgentType,
+      });
+      return;
+    }
+    session.sendMessage(prompt);
   }
 
   async handleCancel(sessionId: string, frontend: FrontendApi) {
@@ -363,6 +374,7 @@ export class ClaudeSessionManager {
     const messageQueue: string[] = [];
     let waiting: ((value: string) => void) | null = null;
     let terminated = false;
+    const abortController = new AbortController();
 
     session.sendMessage = (message: string) => {
       messageQueue.push(message);
@@ -374,6 +386,8 @@ export class ClaudeSessionManager {
     };
     session.terminate = () => {
       terminated = true;
+      messageQueue.length = 0;
+      abortController.abort();
       if (waiting) {
         const resolver = waiting;
         waiting = null;
@@ -383,12 +397,27 @@ export class ClaudeSessionManager {
 
     const promptStream = (async function* () {
       while (true) {
+        if (abortController.signal.aborted) {
+          return;
+        }
         let message: string;
         if (messageQueue.length > 0) {
           message = messageQueue.shift() ?? '';
         } else {
           message = await new Promise<string>((resolve) => {
-            waiting = resolve;
+            if (abortController.signal.aborted) {
+              resolve('');
+              return;
+            }
+            const onAbort = () => {
+              abortController.signal.removeEventListener('abort', onAbort);
+              resolve('');
+            };
+            abortController.signal.addEventListener('abort', onAbort, { once: true });
+            waiting = (value) => {
+              abortController.signal.removeEventListener('abort', onAbort);
+              resolve(value);
+            };
           });
         }
         if (terminated) {
@@ -502,6 +531,7 @@ export class ClaudeSessionManager {
         error: error instanceof Error ? error.message : String(error),
         agentType: 'claude' satisfies AgentType,
       });
+      this.sessions.delete(sessionId);
     }
   }
 }

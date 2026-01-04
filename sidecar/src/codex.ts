@@ -14,6 +14,8 @@ type CodexSessionState = {
   toolSummary: Record<string, number>;
 };
 
+const isToolItemType = (value: string) => value.includes('tool');
+
 const isAbortError = (error: unknown) => {
   if (!error) return false;
   const message = error instanceof Error ? error.message : String(error);
@@ -35,8 +37,11 @@ const extractCodexTextDelta = (
       }
       return { delta: nextText };
     }
-    state.toolSummary[item.type] = (state.toolSummary[item.type] ?? 0) + (event.type === 'item.completed' ? 1 : 0);
-    return { toolSummary: state.toolSummary };
+    if (event.type === 'item.completed' && isToolItemType(item.type)) {
+      state.toolSummary[item.type] = (state.toolSummary[item.type] ?? 0) + 1;
+      return { toolSummary: state.toolSummary };
+    }
+    return {};
   }
   if (event.type === 'turn.completed' || event.type === 'turn.failed') {
     return { isFinal: true, toolSummary: state.toolSummary };
@@ -92,6 +97,8 @@ export class CodexSessionManager {
     });
 
     const threadOptions = {
+      // SECURITY: Codex runs in a trusted local sidecar context with explicit user intent.
+      // Keep these permissive settings scoped to local/dev; revisit if deploying to shared hosts.
       sandboxMode: 'danger-full-access',
       workingDirectory: options.cwd,
       skipGitRepoCheck: true,

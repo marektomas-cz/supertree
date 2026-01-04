@@ -1,10 +1,14 @@
+export type SessionStatus = 'idle' | 'running' | 'error';
+
+export type SessionRole = 'user' | 'assistant' | 'system';
+
 export type SessionRecord = {
   id: string;
   workspaceId: string;
   title?: string | null;
   agentType: 'claude' | 'codex' | 'unknown';
   model?: string | null;
-  status: string;
+  status: SessionStatus;
   unreadCount: number;
   claudeSessionId?: string | null;
   codexSessionId?: string | null;
@@ -16,7 +20,7 @@ export type SessionMessageRecord = {
   id: string;
   sessionId: string;
   turnId: number;
-  role: string;
+  role: SessionRole;
   content: string;
   sentAt?: string | null;
   cancelledAt?: string | null;
@@ -27,7 +31,7 @@ export type SessionMessageEvent = {
   sessionId: string;
   message: {
     id: string;
-    role: string;
+    role: SessionRole;
     content: string;
     metadata?: unknown;
     streaming: boolean;
@@ -36,7 +40,7 @@ export type SessionMessageEvent = {
 
 export type SessionStatusEvent = {
   sessionId: string;
-  status: string;
+  status: SessionStatus;
 };
 
 export type SessionErrorEvent = {
