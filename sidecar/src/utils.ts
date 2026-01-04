@@ -68,8 +68,21 @@ export const parseEnvString = (envString: string): ParsedEnv => {
 
 export const sidecarRoot = () => path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-export const resolveClaudeCliPath = () =>
-  path.join(sidecarRoot(), 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'cli.js');
+export const resolveClaudeCliPath = () => {
+  const cliPath = path.join(
+    sidecarRoot(),
+    'node_modules',
+    '@anthropic-ai',
+    'claude-agent-sdk',
+    'cli.js',
+  );
+  if (!fs.existsSync(cliPath)) {
+    throw new Error(
+      `Claude CLI not found at ${cliPath}. Ensure @anthropic-ai/claude-agent-sdk is installed.`,
+    );
+  }
+  return cliPath;
+};
 
 export const resolveCodexBinaryPath = () => {
   const platform = process.platform;

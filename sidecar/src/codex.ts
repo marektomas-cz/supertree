@@ -1,11 +1,8 @@
 import { Codex, type ThreadEvent, type ThreadItem, type ThreadStartedEvent, type ModelReasoningEffort } from '@openai/codex-sdk';
-import type { AgentType, QueryOptions } from './protocol.js';
+import type { AgentType, FrontendApiBase, QueryOptions } from './protocol.js';
 import { resolveCodexBinaryPath } from './utils.js';
 
-export type FrontendApi = {
-  sendMessage: (payload: unknown) => void;
-  sendError: (payload: unknown) => void;
-};
+export type FrontendApi = FrontendApiBase;
 
 type CodexSessionState = {
   threadId?: string;

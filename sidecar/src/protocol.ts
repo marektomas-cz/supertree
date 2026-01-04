@@ -24,6 +24,11 @@ export const FRONTEND_RPC_METHODS = {
 
 export type AgentType = 'claude' | 'codex' | 'unknown';
 
+export type FrontendApiBase = {
+  sendMessage: (payload: unknown) => void;
+  sendError: (payload: unknown) => void;
+};
+
 export type QueryOptions = {
   /** Shared: working directory for agent execution. */
   cwd: string;

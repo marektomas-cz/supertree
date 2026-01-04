@@ -1,11 +1,9 @@
 import { createSdkMcpServer, query, tool, type PermissionMode, type Query, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
-import type { AgentType, QueryOptions } from './protocol.js';
+import type { AgentType, FrontendApiBase, QueryOptions } from './protocol.js';
 import { parseEnvString, resolveClaudeCliPath } from './utils.js';
 
-export type FrontendApi = {
-  sendMessage: (payload: unknown) => void;
-  sendError: (payload: unknown) => void;
+export type FrontendApi = FrontendApiBase & {
   sendEnterPlanMode: (payload: unknown) => void;
   requestExitPlanMode: (payload: { sessionId: string; toolInput: unknown }) => Promise<{
     approved: boolean;

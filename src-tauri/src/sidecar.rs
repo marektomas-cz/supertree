@@ -19,6 +19,7 @@ use tokio::time::timeout;
 type SidecarWriter = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
 const SOCKET_PATH_TIMEOUT_SECS: u64 = 30;
+const FRONTEND_RESPONSE_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Clone)]
 pub struct SidecarManager {
@@ -312,7 +313,7 @@ impl SidecarManager {
 
   async fn spawn_session(&self, session_id: &str) -> Result<Arc<SidecarSession>, String> {
     // NOTE: One Node sidecar process + socket reader per session for isolation.
-    // Resource usage (processes/FDs) scales linearly; consider pooling if this becomes hot.
+    // Resource usage (processes/FDs) scales linearly; keep session counts bounded.
     let (child, socket_path) = spawn_sidecar_process()?;
     let (reader, writer) = connect_socket(&socket_path).await?;
     let session = Arc::new(SidecarSession {
@@ -611,7 +612,15 @@ async fn wait_for_frontend<T: Serialize + Clone>(
   app_handle
     .emit("session-request", event)
     .map_err(|err| err.to_string())?;
-  rx.await.map_err(|_| "Frontend response dropped".to_string())
+  let response = match timeout(Duration::from_secs(FRONTEND_RESPONSE_TIMEOUT_SECS), rx).await {
+    Ok(result) => result.map_err(|_| "Frontend response dropped".to_string())?,
+    Err(_) => {
+      let mut pending = pending_frontend.lock().await;
+      pending.remove(&request_id);
+      return Err("Frontend response timeout".to_string());
+    }
+  };
+  Ok(response)
 }
 
 async fn handle_sidecar_message(

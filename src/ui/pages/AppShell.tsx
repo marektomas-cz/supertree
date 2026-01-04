@@ -1187,6 +1187,7 @@ export default function AppShell() {
       if (!activeSession) {
         return;
       }
+      const previousMode = permissionModeBySession[activeSession.id] ?? 'default';
       setPermissionModeBySession((prev) => ({ ...prev, [activeSession.id]: mode }));
       if (activeSession.agentType !== 'claude') {
         return;
@@ -1198,9 +1199,13 @@ export default function AppShell() {
         });
       } catch (err) {
         setSendError(String(err));
+        setPermissionModeBySession((prev) => ({
+          ...prev,
+          [activeSession.id]: previousMode,
+        }));
       }
     },
-    [activeSession],
+    [activeSession, permissionModeBySession],
   );
 
   const handleComposerKeyDown = useCallback(
@@ -2492,8 +2497,22 @@ export default function AppShell() {
                               : null;
                           const toolSummary =
                             rawToolSummary && typeof rawToolSummary === 'object'
-                              ? (rawToolSummary as Record<string, number>)
+                              ? (Object.fromEntries(
+                                  Object.entries(
+                                    rawToolSummary as Record<string, unknown>,
+                                  ).flatMap(([tool, value]) => {
+                                    const count =
+                                      typeof value === 'number'
+                                        ? value
+                                        : Number(value);
+                                    return Number.isFinite(count)
+                                      ? [[tool, count]]
+                                      : [];
+                                  }),
+                                ) as Record<string, number>)
                               : null;
+                          const hasToolSummary =
+                            toolSummary && Object.keys(toolSummary).length > 0;
                           return (
                             <div
                               key={message.id}
@@ -2512,7 +2531,7 @@ export default function AppShell() {
                               <pre className="mt-2 whitespace-pre-wrap text-sm text-slate-100">
                                 {message.content}
                               </pre>
-                              {toolSummary ? (
+                              {hasToolSummary ? (
                                 <div className="mt-3 text-xs text-slate-500">
                                   Tools:{' '}
                                   {Object.entries(toolSummary)
