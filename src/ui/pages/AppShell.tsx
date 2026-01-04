@@ -4985,9 +4985,7 @@ export default function AppShell() {
                           </div>
                           <button
                             type="button"
-                            onClick={() =>
-                              activePullRequestUrl && handleCopyMessage(activePullRequestUrl)
-                            }
+                            onClick={() => handleCopyMessage(activePullRequestUrl)}
                             className="rounded-md border border-slate-800 px-2 py-1 text-[10px] uppercase tracking-widest text-slate-500 transition hover:bg-slate-900 hover:text-slate-100"
                           >
                             Copy link
