@@ -2,6 +2,7 @@
 
 mod db;
 mod git;
+mod attachments;
 mod paths;
 mod repos;
 mod settings;
@@ -29,6 +30,7 @@ use std::os::unix::process::CommandExt;
 use libc;
 
 use crate::db::{Database, DbError};
+use crate::attachments::AttachmentRecord;
 use crate::git::{
   branch_exists, clone_repo, create_worktree, inspect_repo, is_git_repo, read_supertree_config,
   remove_worktree, repo_name_from_url, set_sparse_checkout,
@@ -146,6 +148,17 @@ struct SendSessionMessageRequest {
   session_id: String,
   prompt: String,
   permission_mode: Option<String>,
+  attachment_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAttachmentRequest {
+  session_id: String,
+  file_name: String,
+  mime_type: Option<String>,
+  source_path: Option<String>,
+  bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -655,6 +668,18 @@ async fn createSession(
 
 #[allow(non_snake_case)]
 #[tauri::command]
+async fn updateSessionModel(
+  db: tauri::State<'_, Database>,
+  session_id: String,
+  model: Option<String>,
+) -> Result<(), String> {
+  sessions::set_session_model(db.pool(), &session_id, model.as_deref())
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
 async fn deleteSession(
   db: tauri::State<'_, Database>,
   sidecar: tauri::State<'_, SidecarManager>,
@@ -673,6 +698,95 @@ async fn listSessionMessages(
   session_id: String,
 ) -> Result<Vec<SessionMessageRecord>, String> {
   sessions::list_session_messages(db.pool(), &session_id)
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn listSessionAttachments(
+  db: tauri::State<'_, Database>,
+  session_id: String,
+) -> Result<Vec<AttachmentRecord>, String> {
+  attachments::list_session_attachments(db.pool(), &session_id)
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn createAttachment(
+  db: tauri::State<'_, Database>,
+  payload: CreateAttachmentRequest,
+) -> Result<AttachmentRecord, String> {
+  let session = sessions::get_session(db.pool(), &payload.session_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let workspace_record = workspace::get_workspace(db.pool(), &session.workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let workspace_path = PathBuf::from(&workspace_record.path);
+  ensure_context_dirs(&workspace_path)?;
+  let attachment_id = attachments::generate_attachment_id(db.pool())
+    .await
+    .map_err(|err| err.to_string())?;
+  let sanitized = sanitize_filename(&payload.file_name);
+  let relative_path = PathBuf::from(".context")
+    .join("attachments")
+    .join(format!("{attachment_id}-{sanitized}"));
+  let absolute_path = workspace_path.join(&relative_path);
+
+  if let Some(source_path) = payload.source_path.as_ref() {
+    let source = PathBuf::from(source_path);
+    if !source.is_file() {
+      return Err(format!("Attachment source is not a file: {source_path}"));
+    }
+    fs::copy(&source, &absolute_path).map_err(|err| err.to_string())?;
+  } else if let Some(bytes) = payload.bytes.as_ref() {
+    fs::write(&absolute_path, bytes).map_err(|err| err.to_string())?;
+  } else {
+    return Err("Attachment payload is missing source data".to_string());
+  }
+
+  attachments::insert_attachment(
+    db.pool(),
+    attachments::NewAttachment {
+      id: attachment_id,
+      session_id: session.id,
+      session_message_id: None,
+      attachment_type: "file".to_string(),
+      title: Some(payload.file_name),
+      path: Some(relative_path.to_string_lossy().to_string()),
+      mime_type: payload.mime_type,
+      is_draft: true,
+    },
+  )
+  .await
+  .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn deleteAttachment(
+  db: tauri::State<'_, Database>,
+  attachment_id: String,
+) -> Result<(), String> {
+  let attachment = attachments::get_attachment(db.pool(), &attachment_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  if let Some(path) = attachment.path {
+    let session = sessions::get_session(db.pool(), &attachment.session_id)
+      .await
+      .map_err(|err| err.to_string())?;
+    let workspace_record = workspace::get_workspace(db.pool(), &session.workspace_id)
+      .await
+      .map_err(|err| err.to_string())?;
+    let absolute_path = PathBuf::from(&workspace_record.path).join(path);
+    if absolute_path.exists() {
+      fs::remove_file(&absolute_path).map_err(|err| err.to_string())?;
+    }
+  }
+  attachments::delete_attachment(db.pool(), &attachment_id)
     .await
     .map_err(|err| err.to_string())
 }
@@ -715,6 +829,19 @@ async fn sendSessionMessage(
   .await
   .map_err(|err| err.to_string())?;
   let turn_id = user_message.turn_id;
+
+  if let Some(attachment_ids) = payload.attachment_ids.as_ref() {
+    if !attachment_ids.is_empty() {
+      attachments::attach_attachments_to_message(
+        db.pool(),
+        &session.id,
+        &user_message.id,
+        attachment_ids,
+      )
+      .await
+      .map_err(|err| err.to_string())?;
+    }
+  }
 
   let options = build_session_query_options(
     &session,
@@ -1328,8 +1455,28 @@ fn build_open_command(path: &PathBuf, target: &OpenTarget) -> Command {
 }
 
 fn ensure_context_dirs(workspace_path: &Path) -> Result<(), String> {
-  let context_dir = workspace_path.join(".context").join("attachments");
+  let context_dir = workspace_path.join(".context").join("attachments");        
   fs::create_dir_all(&context_dir).map_err(|err| err.to_string())
+}
+
+fn sanitize_filename(value: &str) -> String {
+  let base = Path::new(value)
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or("attachment");
+  let mut sanitized = String::with_capacity(base.len());
+  for ch in base.chars() {
+    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+      sanitized.push(ch);
+    } else {
+      sanitized.push('_');
+    }
+  }
+  if sanitized.is_empty() {
+    "attachment".to_string()
+  } else {
+    sanitized
+  }
 }
 
 const MAX_WORKSPACE_FILES: usize = 2000;
@@ -1712,10 +1859,14 @@ fn main() {
       listSessions,
       createWorkspace,
       createSession,
+      updateSessionModel,
       archiveWorkspace,
       deleteSession,
       unarchiveWorkspace,
       listSessionMessages,
+      listSessionAttachments,
+      createAttachment,
+      deleteAttachment,
       pinWorkspace,
       markWorkspaceUnread,
       sendSessionMessage,

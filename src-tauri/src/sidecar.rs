@@ -673,11 +673,18 @@ async fn handle_sidecar_message(
     return Ok(());
   }
 
-  let metadata = json!({
+  let mut metadata = json!({
     "agentType": payload.agent_type,
     "raw": payload.data,
     "toolSummary": payload.tool_summary,
   });
+  if payload.is_final.unwrap_or(false) {
+    if let Some(diff_stat) = get_workspace_diff_stat(db, &payload.id).await {
+      if let Some(object) = metadata.as_object_mut() {
+        object.insert("diffStat".to_string(), Value::String(diff_stat));
+      }
+    }
+  }
   let metadata_str = metadata.to_string();
 
   let (message_id, inserted) = match stream_state.assistant_message_id.clone() {
@@ -827,6 +834,31 @@ async fn get_diff_response(db: &Database, payload: &GetDiffPayload) -> Result<Va
   .map_err(|err| err.to_string())??;
 
   Ok(json!({ "diff": diff }))
+}
+
+async fn get_workspace_diff_stat(db: &Database, session_id: &str) -> Option<String> {
+  let payload = GetDiffPayload {
+    session_id: session_id.to_string(),
+    file: None,
+    stat: Some(true),
+  };
+  match get_diff_response(db, &payload).await {
+    Ok(value) => value
+      .get("diff")
+      .and_then(|diff| diff.as_str())
+      .map(|diff| {
+        let trimmed = diff.trim();
+        if trimmed.is_empty() {
+          "No changes".to_string()
+        } else {
+          trimmed.to_string()
+        }
+      }),
+    Err(err) => {
+      eprintln!("[sidecar] diff stat error: {err}");
+      None
+    }
+  }
 }
 
 fn normalize_relative_path(path: &std::path::Path) -> Result<PathBuf, String> {

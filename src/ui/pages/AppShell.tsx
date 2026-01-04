@@ -15,6 +15,7 @@ import { formatGreeting } from '@/lib/format';
 import type { OpenTarget, RepoInfo } from '@/types/repo';
 import type {
   AskUserQuestionEvent,
+  AttachmentRecord,
   ExitPlanModeEvent,
   SessionErrorEvent,
   SessionMessageEvent,
@@ -38,6 +39,14 @@ type SessionMessageItem = {
   cancelledAt?: string | null;
   metadata?: Record<string, unknown> | null;
   streaming?: boolean;
+};
+
+type ComposerSuggestion = {
+  id: string;
+  label: string;
+  value: string;
+  mode: 'slash' | 'mention';
+  description?: string;
 };
 
 type RunOutputEvent = {
@@ -72,6 +81,8 @@ const STORAGE_KEYS = {
   leftWidth: 'supertree.leftSidebarWidth',
   rightWidth: 'supertree.rightSidebarWidth',
   zenMode: 'supertree.zenMode',
+  openSessions: 'supertree.openSessionsByWorkspace',
+  activeSessions: 'supertree.activeSessionsByWorkspace',
 };
 
 const readBoolean = (key: string, fallback: boolean) => {
@@ -95,6 +106,28 @@ const readNumber = (key: string, fallback: number) => {
   }
   const parsed = Number(value);
   return Number.isNaN(parsed) ? fallback : parsed;
+};
+
+const readJson = <T,>(key: string, fallback: T): T => {
+  if (typeof window === 'undefined') {
+    return fallback;
+  }
+  const value = window.localStorage.getItem(key);
+  if (!value) {
+    return fallback;
+  }
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+};
+
+const writeJson = (key: string, value: unknown) => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.localStorage.setItem(key, JSON.stringify(value));
 };
 
 const clamp = (value: number, min: number, max: number) =>
@@ -150,6 +183,163 @@ const formatAgentLabel = (agentType: SessionRecord['agentType']) => {
   return 'Unknown';
 };
 
+const MODEL_GROUPS = [
+  {
+    id: 'claude',
+    label: 'Claude Code',
+    models: [
+      { id: 'claude-3-5-sonnet', label: 'Claude 3.5 Sonnet' },
+      { id: 'claude-3-5-haiku', label: 'Claude 3.5 Haiku' },
+      { id: 'claude-3-opus', label: 'Claude 3 Opus' },
+    ],
+  },
+  {
+    id: 'codex',
+    label: 'Codex',
+    models: [
+      { id: 'gpt-5-codex', label: 'GPT-5 Codex' },
+      { id: 'gpt-4.1-codex', label: 'GPT-4.1 Codex' },
+    ],
+  },
+] as const;
+
+const CONTEXT_LIMITS: Record<'claude' | 'codex', number> = {
+  claude: 200_000,
+  codex: 128_000,
+};
+
+const COMMANDS_PREFIX = '.claude/commands/';
+
+const MODEL_LOOKUP = (() => {
+  const agentById = new Map<string, 'claude' | 'codex'>();
+  const labelById = new Map<string, string>();
+  for (const group of MODEL_GROUPS) {
+    for (const model of group.models) {
+      agentById.set(model.id, group.id);
+      labelById.set(model.id, model.label);
+    }
+  }
+  return { agentById, labelById };
+})();
+
+const getDefaultModel = (agentType: 'claude' | 'codex') => {
+  const group = MODEL_GROUPS.find((item) => item.id === agentType);
+  return group?.models[0]?.id ?? null;
+};
+
+const getModelLabel = (modelId?: string | null) =>
+  modelId ? MODEL_LOOKUP.labelById.get(modelId) ?? modelId : null;
+
+type MarkdownChunk =
+  | { type: 'text'; content: string }
+  | { type: 'code'; content: string; language?: string };
+
+const splitMarkdown = (input: string): MarkdownChunk[] => {
+  const chunks: MarkdownChunk[] = [];
+  const pattern = /```([^\n]*)\n([\s\S]*?)```/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(input)) !== null) {
+    if (match.index > lastIndex) {
+      chunks.push({ type: 'text', content: input.slice(lastIndex, match.index) });
+    }
+    const language = match[1]?.trim() || undefined;
+    chunks.push({ type: 'code', content: match[2] ?? '', language });
+    lastIndex = pattern.lastIndex;
+  }
+  if (lastIndex < input.length) {
+    chunks.push({ type: 'text', content: input.slice(lastIndex) });
+  }
+  return chunks;
+};
+
+const renderMentions = (
+  text: string,
+  fileSet: Set<string>,
+  onMentionClick: (path: string) => void,
+) => {
+  const tokens: Array<string | JSX.Element> = [];
+  const mentionRegex = /@([A-Za-z0-9._/\\-]+)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = mentionRegex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      tokens.push(text.slice(lastIndex, match.index));
+    }
+    const full = match[0];
+    const path = match[1];
+    if (fileSet.has(path)) {
+      tokens.push(
+        <button
+          key={`${path}-${match.index}`}
+          type="button"
+          onClick={() => onMentionClick(path)}
+          className="rounded border border-slate-800 px-1 text-xs text-slate-200 hover:bg-slate-900"
+        >
+          {full}
+        </button>,
+      );
+    } else {
+      tokens.push(full);
+    }
+    lastIndex = match.index + full.length;
+  }
+  if (lastIndex < text.length) {
+    tokens.push(text.slice(lastIndex));
+  }
+  return tokens;
+};
+
+const renderInlineMarkdown = (
+  text: string,
+  fileSet: Set<string>,
+  onMentionClick: (path: string) => void,
+) => {
+  if (!text) {
+    return null;
+  }
+  const parts = text.split(/`([^`]+)`/g);
+  return parts.map((part, index) => {
+    if (index % 2 === 1) {
+      return (
+        <code
+          key={`inline-${index}`}
+          className="rounded bg-slate-900 px-1 py-0.5 text-xs text-slate-100"
+        >
+          {part}
+        </code>
+      );
+    }
+    const mentions = renderMentions(part, fileSet, onMentionClick);
+    return <span key={`text-${index}`}>{mentions}</span>;
+  });
+};
+
+const renderMarkdownContent = (
+  content: string,
+  fileSet: Set<string>,
+  onMentionClick: (path: string) => void,
+) => {
+  const chunks = splitMarkdown(content);
+  return chunks.map((chunk, index) => {
+    if (chunk.type === 'code') {
+      return (
+        <pre
+          key={`code-${index}`}
+          className="mt-3 overflow-auto rounded-md border border-slate-800 bg-slate-950 p-3 text-xs text-slate-100"
+        >
+          <code>{chunk.content}</code>
+        </pre>
+      );
+    }
+    return (
+      <div key={`text-${index}`} className="whitespace-pre-wrap text-sm text-slate-100">
+        {renderInlineMarkdown(chunk.content, fileSet, onMentionClick)}
+      </div>
+    );
+  });
+};
+
 const DIFF_PLACEHOLDER = `diff --git a/src/main.tsx b/src/main.tsx
 index 5b8c3d2..c19b2e1 100644
 --- a/src/main.tsx
@@ -187,6 +377,9 @@ export default function AppShell() {
   const [addState, setAddState] = useState<'idle' | 'adding' | 'error'>('idle');
   const [addError, setAddError] = useState<string | null>(null);
   const addRepoRef = useRef<HTMLDivElement>(null);
+  const historyRef = useRef<HTMLDivElement>(null);
+  const linkIssueRef = useRef<HTMLDivElement>(null);
+  const newChatRef = useRef<HTMLDivElement>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
@@ -242,8 +435,20 @@ export default function AppShell() {
   const [sessionsByWorkspace, setSessionsByWorkspace] = useState<
     Record<string, SessionRecord[]>
   >({});
+  const [openSessionIdsByWorkspace, setOpenSessionIdsByWorkspace] = useState<
+    Record<string, string[]>
+  >(() => readJson(STORAGE_KEYS.openSessions, {}));
+  const [closedSessionIdsByWorkspace, setClosedSessionIdsByWorkspace] = useState<
+    Record<string, string[]>
+  >({});
   const [messagesBySession, setMessagesBySession] = useState<
     Record<string, SessionMessageItem[]>
+  >({});
+  const [attachmentsBySession, setAttachmentsBySession] = useState<
+    Record<string, AttachmentRecord[]>
+  >({});
+  const [draftAttachmentsBySession, setDraftAttachmentsBySession] = useState<
+    Record<string, AttachmentRecord[]>
   >({});
   const [sessionErrors, setSessionErrors] = useState<
     Record<string, string | null>
@@ -258,9 +463,30 @@ export default function AppShell() {
     Record<string, string>
   >({});
   const [composerValue, setComposerValue] = useState('');
+  const [composerDragActive, setComposerDragActive] = useState(false);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const [composerSuggestions, setComposerSuggestions] = useState<ComposerSuggestion[]>([]);
+  const [composerSuggestionIndex, setComposerSuggestionIndex] = useState(0);
+  const [composerSuggestionRange, setComposerSuggestionRange] = useState<{
+    start: number;
+    end: number;
+  } | null>(null);
   const [newChatAgentType, setNewChatAgentType] = useState<'claude' | 'codex'>(
     'claude',
   );
+  const [newChatModelByAgent, setNewChatModelByAgent] = useState<
+    Record<'claude' | 'codex', string | null>
+  >({ claude: null, codex: null });
+  const [newChatOpen, setNewChatOpen] = useState(false);
+  const [newChatContextIds, setNewChatContextIds] = useState<string[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [linkIssueOpen, setLinkIssueOpen] = useState(false);
+  const [linkIssueValue, setLinkIssueValue] = useState('');
+  const [linkedIssueBySession, setLinkedIssueBySession] = useState<
+    Record<string, string>
+  >({});
+  const [pendingIssueId, setPendingIssueId] = useState<string | null>(null);
   const [sessionListError, setSessionListError] = useState<string | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
   const [pendingAskQueue, setPendingAskQueue] = useState<AskUserQuestionEvent[]>(
@@ -272,7 +498,7 @@ export default function AppShell() {
   const [askAnswers, setAskAnswers] = useState<string[]>([]);
   const [activeSessionByWorkspace, setActiveSessionByWorkspace] = useState<
     Record<string, string | null>
-  >({});
+  >(() => readJson(STORAGE_KEYS.activeSessions, {}));
   const [activeTabByWorkspace, setActiveTabByWorkspace] = useState<
     Record<string, 'changes' | 'session'>
   >({});
@@ -319,14 +545,27 @@ export default function AppShell() {
     if (!activeWorkspaceId) {
       return [];
     }
-    return sessionsByWorkspace[activeWorkspaceId] ?? [];
-  }, [activeWorkspaceId, sessionsByWorkspace]);
+    const sessions = sessionsByWorkspace[activeWorkspaceId] ?? [];
+    const openIds = openSessionIdsByWorkspace[activeWorkspaceId] ?? [];
+    if (openIds.length === 0) {
+      return sessions;
+    }
+    const byId = new Map(sessions.map((session) => [session.id, session]));
+    return openIds
+      .map((id) => byId.get(id))
+      .filter((session): session is SessionRecord => Boolean(session));
+  }, [activeWorkspaceId, openSessionIdsByWorkspace, sessionsByWorkspace]);
   const activeSessionId = useMemo(() => {
     if (!activeWorkspaceId) {
       return null;
     }
-    return activeSessionByWorkspace[activeWorkspaceId] ?? null;
-  }, [activeSessionByWorkspace, activeWorkspaceId]);
+    const activeId = activeSessionByWorkspace[activeWorkspaceId] ?? null;
+    const openIds = openSessionIdsByWorkspace[activeWorkspaceId] ?? [];
+    if (activeId && openIds.includes(activeId)) {
+      return activeId;
+    }
+    return openIds.length > 0 ? openIds[openIds.length - 1] : null;
+  }, [activeSessionByWorkspace, activeWorkspaceId, openSessionIdsByWorkspace]);
   const activeSession = useMemo(() => {
     if (!activeSessionId) {
       return null;
@@ -345,6 +584,18 @@ export default function AppShell() {
     }
     return messagesBySession[activeSessionId] ?? [];
   }, [activeSessionId, messagesBySession]);
+  const activeSessionAttachments = useMemo(() => {
+    if (!activeSessionId) {
+      return [];
+    }
+    return attachmentsBySession[activeSessionId] ?? [];
+  }, [activeSessionId, attachmentsBySession]);
+  const activeDraftAttachments = useMemo(() => {
+    if (!activeSessionId) {
+      return [];
+    }
+    return draftAttachmentsBySession[activeSessionId] ?? [];
+  }, [activeSessionId, draftAttachmentsBySession]);
   const activeSessionError = activeSessionId
     ? sessionErrors[activeSessionId] ?? null
     : null;
@@ -354,6 +605,31 @@ export default function AppShell() {
   const activePermissionMode = activeSessionId
     ? permissionModeBySession[activeSessionId] ?? 'default'
     : 'default';
+  const contextUsagePercent = useMemo(() => {
+    if (!activeSession) {
+      return null;
+    }
+    const agentType = activeSession.agentType === 'codex' ? 'codex' : 'claude';
+    const limit = CONTEXT_LIMITS[agentType] ?? 0;
+    const count = activeSession.contextTokenCount ?? 0;
+    if (limit === 0) {
+      return null;
+    }
+    return Math.min(100, Math.round((count / limit) * 100));
+  }, [activeSession]);
+  const selectedModelId = useMemo(() => {
+    if (activeSession) {
+      return (
+        activeSession.model ??
+        getDefaultModel(activeSession.agentType === 'codex' ? 'codex' : 'claude')
+      );
+    }
+    return (
+      newChatModelByAgent[newChatAgentType] ??
+      getDefaultModel(newChatAgentType)
+    );
+  }, [activeSession, newChatAgentType, newChatModelByAgent]);
+  const modelGroupsForSelection = useMemo(() => MODEL_GROUPS, []);
   const canSendMessage =
     Boolean(activeWorkspaceId) &&
     composerValue.trim().length > 0 &&
@@ -373,6 +649,17 @@ export default function AppShell() {
     }
     return filesByWorkspace[activeWorkspaceId] ?? [];
   }, [activeWorkspaceId, filesByWorkspace]);
+  const workspaceFileSet = useMemo(
+    () => new Set(workspaceFiles),
+    [workspaceFiles],
+  );
+  const slashCommands = useMemo(() => {
+    return workspaceFiles
+      .filter((path) => path.startsWith(COMMANDS_PREFIX))
+      .map((path) => path.slice(COMMANDS_PREFIX.length))
+      .map((name) => name.replace(/\.[^/.]+$/, ''))
+      .filter(Boolean);
+  }, [workspaceFiles]);
   const recentFiles = useMemo(() => {
     if (!activeWorkspaceId) {
       return [];
@@ -413,6 +700,24 @@ export default function AppShell() {
       /Mac|iPhone|iPod|iPad/i.test(navigator.platform),
     [],
   );
+  const closedSessions = useMemo(() => {
+    if (!activeWorkspaceId) {
+      return [];
+    }
+    const closedIds = closedSessionIdsByWorkspace[activeWorkspaceId] ?? [];
+    const sessions = sessionsByWorkspace[activeWorkspaceId] ?? [];
+    const byId = new Map(sessions.map((session) => [session.id, session]));
+    return closedIds
+      .map((id) => byId.get(id))
+      .filter((session): session is SessionRecord => Boolean(session));
+  }, [activeWorkspaceId, closedSessionIdsByWorkspace, sessionsByWorkspace]);
+  const recentSessions = useMemo(() => {
+    if (!activeWorkspaceId) {
+      return [];
+    }
+    const sessions = sessionsByWorkspace[activeWorkspaceId] ?? [];
+    return sessions.slice(-6).reverse();
+  }, [activeWorkspaceId, sessionsByWorkspace]);
   const workspacesByRepo = useMemo(() => {
     const grouped = new Map<string, WorkspaceInfo[]>();
     for (const workspace of workspaces) {
@@ -496,6 +801,42 @@ export default function AppShell() {
         list.push(session);
         grouped[session.workspaceId] = list;
       }
+      let nextOpenByWorkspace: Record<string, string[]> = {};
+      setOpenSessionIdsByWorkspace((prev) => {
+        const next: Record<string, string[]> = {};
+        for (const [workspaceId, list] of Object.entries(grouped)) {
+          const available = list.map((session) => session.id);
+          const hasExisting = Object.prototype.hasOwnProperty.call(prev, workspaceId);
+          const existingOpen = prev[workspaceId] ?? [];
+          const filteredOpen = existingOpen.filter((id) =>
+            available.includes(id),
+          );
+          if (filteredOpen.length > 0) {
+            next[workspaceId] = filteredOpen;
+            continue;
+          }
+          if (hasExisting) {
+            next[workspaceId] = [];
+            continue;
+          }
+          next[workspaceId] =
+            available.length > 0 ? [available[available.length - 1]] : [];
+        }
+        nextOpenByWorkspace = next;
+        return next;
+      });
+      setClosedSessionIdsByWorkspace((prev) => {
+        const next: Record<string, string[]> = {};
+        for (const [workspaceId, list] of Object.entries(grouped)) {
+          const available = list.map((session) => session.id);
+          const existingClosed = prev[workspaceId] ?? [];
+          const openIds = nextOpenByWorkspace[workspaceId] ?? [];
+          next[workspaceId] = existingClosed.filter(
+            (id) => available.includes(id) && !openIds.includes(id),
+          );
+        }
+        return next;
+      });
       setSessionsByWorkspace(grouped);
       setSessionStatuses(() => {
         const next: Record<string, SessionRecord['status']> = {};
@@ -518,15 +859,17 @@ export default function AppShell() {
             next[workspaceId] = null;
           }
         }
-        for (const [workspaceId, sessions] of Object.entries(grouped)) {
+        for (const workspaceId of Object.keys(grouped)) {
+          const openIds = nextOpenByWorkspace[workspaceId] ?? [];
           const activeId = next[workspaceId];
-          if (activeId && !sessions.some((session) => session.id === activeId)) {
-            next[workspaceId] = sessions.length > 0 ? sessions[sessions.length - 1].id : null;
+          if (openIds.length === 0) {
+            next[workspaceId] = null;
             continue;
           }
-          if (!activeId && sessions.length > 0) {
-            next[workspaceId] = sessions[sessions.length - 1].id;
+          if (activeId && openIds.includes(activeId)) {
+            continue;
           }
+          next[workspaceId] = openIds[openIds.length - 1];
         }
         return next;
       });
@@ -544,6 +887,20 @@ export default function AppShell() {
       });
       const normalized = data.map((message) => normalizeSessionMessage(message));
       setMessagesBySession((prev) => ({ ...prev, [sessionId]: normalized }));
+    } catch (err) {
+      setSessionErrors((prev) => ({ ...prev, [sessionId]: String(err) }));
+    }
+  }, []);
+
+  const loadSessionAttachments = useCallback(async (sessionId: string) => {
+    try {
+      const data = await invoke<AttachmentRecord[]>('listSessionAttachments', {
+        sessionId,
+      });
+      const drafts = data.filter((item) => item.isDraft);
+      const attached = data.filter((item) => !item.isDraft);
+      setAttachmentsBySession((prev) => ({ ...prev, [sessionId]: attached }));
+      setDraftAttachmentsBySession((prev) => ({ ...prev, [sessionId]: drafts }));
     } catch (err) {
       setSessionErrors((prev) => ({ ...prev, [sessionId]: String(err) }));
     }
@@ -618,8 +975,39 @@ export default function AppShell() {
   }, [activeSessionId, loadSessionMessages, messagesBySession]);
 
   useEffect(() => {
+    if (!activeSessionId) {
+      return;
+    }
+    const hasAttachments =
+      Object.prototype.hasOwnProperty.call(
+        attachmentsBySession,
+        activeSessionId,
+      ) ||
+      Object.prototype.hasOwnProperty.call(
+        draftAttachmentsBySession,
+        activeSessionId,
+      );
+    if (hasAttachments) {
+      return;
+    }
+    loadSessionAttachments(activeSessionId);
+  }, [
+    activeSessionId,
+    attachmentsBySession,
+    draftAttachmentsBySession,
+    loadSessionAttachments,
+  ]);
+
+  useEffect(() => {
     setSendError(null);
   }, [activeSessionId]);
+
+  useEffect(() => {
+    setNewChatModelByAgent((prev) => ({
+      claude: prev.claude ?? getDefaultModel('claude'),
+      codex: prev.codex ?? getDefaultModel('codex'),
+    }));
+  }, []);
 
   useEffect(() => {
     if (!activeAskRequest) {
@@ -655,6 +1043,14 @@ export default function AppShell() {
     leftSidebarWidth,
     rightSidebarWidth,
   ]);
+
+  useEffect(() => {
+    writeJson(STORAGE_KEYS.openSessions, openSessionIdsByWorkspace);
+  }, [openSessionIdsByWorkspace]);
+
+  useEffect(() => {
+    writeJson(STORAGE_KEYS.activeSessions, activeSessionByWorkspace);
+  }, [activeSessionByWorkspace]);
 
   useEffect(() => {
     const runOutputUnlisten = listen<RunOutputEvent>('run-output', (event) => {
@@ -1013,13 +1409,21 @@ export default function AppShell() {
   );
 
   const createSessionForWorkspace = useCallback(
-    async (workspaceId: string, agentType = newChatAgentType) => {
+    async (
+      workspaceId: string,
+      agentType = newChatAgentType,
+      modelOverride?: string | null,
+    ) => {
       setSessionListError(null);
       try {
+        const resolvedModel =
+          modelOverride ??
+          newChatModelByAgent[agentType] ??
+          getDefaultModel(agentType);
         const session = await invoke<SessionRecord>('createSession', {
           workspaceId,
           agentType,
-          model: null,
+          model: resolvedModel,
         });
         setSessionsByWorkspace((prev) => {
           const list = prev[workspaceId] ?? [];
@@ -1031,6 +1435,23 @@ export default function AppShell() {
           ...prev,
           [session.id]: prev[session.id] ?? 'default',
         }));
+        setOpenSessionIdsByWorkspace((prev) => {
+          const existing = prev[workspaceId] ?? [];
+          if (existing.includes(session.id)) {
+            return prev;
+          }
+          return { ...prev, [workspaceId]: [...existing, session.id] };
+        });
+        setClosedSessionIdsByWorkspace((prev) => {
+          const existing = prev[workspaceId] ?? [];
+          if (!existing.includes(session.id)) {
+            return prev;
+          }
+          return {
+            ...prev,
+            [workspaceId]: existing.filter((id) => id !== session.id),
+          };
+        });
         setActiveSessionByWorkspace((prev) => ({
           ...prev,
           [workspaceId]: session.id,
@@ -1045,72 +1466,122 @@ export default function AppShell() {
         throw err;
       }
     },
-    [newChatAgentType],
+    [newChatAgentType, newChatModelByAgent],
   );
 
   const handleNewChat = useCallback(() => {
     if (!activeWorkspaceId) {
       return;
     }
+    setNewChatContextIds([]);
+    setNewChatOpen(true);
     setActiveView('workspace');
-    void createSessionForWorkspace(activeWorkspaceId);
-  }, [activeWorkspaceId, createSessionForWorkspace, setActiveView]);
+  }, [activeWorkspaceId, setActiveView]);
 
-  const handleSelectSession = useCallback((workspaceId: string, sessionId: string) => {
-    setSelectedWorkspaceId(workspaceId);
-    setActiveView('workspace');
-    setActiveSessionByWorkspace((prev) => ({ ...prev, [workspaceId]: sessionId }));
-    setActiveTabByWorkspace((prev) => ({ ...prev, [workspaceId]: 'session' }));
+  const handleStartNewChat = useCallback(async () => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    try {
+      await createSessionForWorkspace(
+        activeWorkspaceId,
+        newChatAgentType,
+        newChatModelByAgent[newChatAgentType] ??
+          getDefaultModel(newChatAgentType),
+      );
+      setNewChatOpen(false);
+      setNewChatContextIds([]);
+    } catch {
+      return;
+    }
+  }, [
+    activeWorkspaceId,
+    createSessionForWorkspace,
+    newChatAgentType,
+    newChatModelByAgent,
+  ]);
+
+  const toggleNewChatContext = useCallback((sessionId: string) => {
+    setNewChatContextIds((prev) =>
+      prev.includes(sessionId)
+        ? prev.filter((id) => id !== sessionId)
+        : [...prev, sessionId],
+    );
   }, []);
 
+  const handleSelectSession = useCallback(
+    (workspaceId: string, sessionId: string) => {
+      setSelectedWorkspaceId(workspaceId);
+      setActiveView('workspace');
+      setOpenSessionIdsByWorkspace((prev) => {
+        const existing = prev[workspaceId] ?? [];
+        if (existing.includes(sessionId)) {
+          return prev;
+        }
+        return { ...prev, [workspaceId]: [...existing, sessionId] };
+      });
+      setClosedSessionIdsByWorkspace((prev) => {
+        const existing = prev[workspaceId] ?? [];
+        if (!existing.includes(sessionId)) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [workspaceId]: existing.filter((id) => id !== sessionId),
+        };
+      });
+      setActiveSessionByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: sessionId,
+      }));
+      setActiveTabByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: 'session',
+      }));
+    },
+    [],
+  );
+
   const handleCloseSession = useCallback(
-    async (workspaceId: string, sessionId: string) => {
-      const isClosingActive = activeSessionByWorkspace[workspaceId] === sessionId;
-      const remaining = (sessionsByWorkspace[workspaceId] ?? []).filter(
-        (session) => session.id !== sessionId,
-      );
-      try {
-        await invoke('deleteSession', { sessionId });
-      } catch (err) {
-        setSessionErrors((prev) => ({ ...prev, [sessionId]: String(err) }));
-        return;
-      }
-      setSessionsByWorkspace((prev) => ({ ...prev, [workspaceId]: remaining }));
-      setMessagesBySession((prev) => {
-        const next = { ...prev };
-        delete next[sessionId];
-        return next;
+    (workspaceId: string, sessionId: string) => {
+      const isClosingActive =
+        activeSessionByWorkspace[workspaceId] === sessionId;
+      let nextOpenIds: string[] = [];
+      setOpenSessionIdsByWorkspace((prev) => {
+        const existing = prev[workspaceId] ?? [];
+        if (!existing.includes(sessionId)) {
+          nextOpenIds = existing;
+          return prev;
+        }
+        nextOpenIds = existing.filter((id) => id !== sessionId);
+        return {
+          ...prev,
+          [workspaceId]: nextOpenIds,
+        };
       });
-      setSessionErrors((prev) => {
-        const next = { ...prev };
-        delete next[sessionId];
-        return next;
-      });
-      setSessionStatuses((prev) => {
-        const next = { ...prev };
-        delete next[sessionId];
-        return next;
-      });
-      setPermissionModeBySession((prev) => {
-        const next = { ...prev };
-        delete next[sessionId];
-        return next;
-      });
-      setPlanModeBySession((prev) => {
-        const next = { ...prev };
-        delete next[sessionId];
-        return next;
+      setClosedSessionIdsByWorkspace((prev) => {
+        const existing = prev[workspaceId] ?? [];
+        const next = [
+          sessionId,
+          ...existing.filter((id) => id !== sessionId),
+        ].slice(0, 8);
+        return { ...prev, [workspaceId]: next };
       });
       if (isClosingActive) {
-        const nextActive = remaining.length > 0 ? remaining[remaining.length - 1].id : null;
-        setActiveSessionByWorkspace((prev) => ({ ...prev, [workspaceId]: nextActive }));
+        setActiveSessionByWorkspace((prev) => {
+          return {
+            ...prev,
+            [workspaceId]:
+              nextOpenIds.length > 0 ? nextOpenIds[nextOpenIds.length - 1] : null,
+          };
+        });
         setActiveTabByWorkspace((prev) => ({
           ...prev,
-          [workspaceId]: nextActive ? 'session' : 'changes',
+          [workspaceId]: nextOpenIds.length > 0 ? 'session' : 'changes',
         }));
       }
     },
-    [activeSessionByWorkspace, sessionsByWorkspace],
+    [activeSessionByWorkspace],
   );
 
   const handleSendMessage = useCallback(async () => {
@@ -1142,12 +1613,15 @@ export default function AppShell() {
       session.agentType === 'claude'
         ? permissionModeBySession[session.id] ?? 'default'
         : undefined;
+    const draftAttachments = draftAttachmentsBySession[session.id] ?? [];
+    const attachmentIds = draftAttachments.map((item) => item.id);
     try {
       setSessionErrors((prev) => ({ ...prev, [session.id]: null }));
       const userMessage = await invoke<SessionMessageRecord>('sendSessionMessage', {
         sessionId: session.id,
         prompt,
         permissionMode,
+        attachmentIds: attachmentIds.length > 0 ? attachmentIds : undefined,
       });
       const normalized = normalizeSessionMessage(userMessage);
       setMessagesBySession((prev) => {
@@ -1155,6 +1629,21 @@ export default function AppShell() {
         return { ...prev, [session.id]: [...list, normalized] };
       });
       setComposerValue('');
+      setComposerSuggestions([]);
+      setComposerSuggestionIndex(0);
+      setComposerSuggestionRange(null);
+      setDraftAttachmentsBySession((prev) => ({
+        ...prev,
+        [session.id]: [],
+      }));
+      void loadSessionAttachments(session.id);
+      if (pendingIssueId) {
+        setLinkedIssueBySession((prev) => ({
+          ...prev,
+          [session.id]: pendingIssueId,
+        }));
+        setPendingIssueId(null);
+      }
       setSessionStatuses((prev) => ({ ...prev, [session.id]: 'running' }));
     } catch (err) {
       setSendError(String(err));
@@ -1166,6 +1655,9 @@ export default function AppShell() {
     activeWorkspaceId,
     composerValue,
     createSessionForWorkspace,
+    draftAttachmentsBySession,
+    loadSessionAttachments,
+    pendingIssueId,
     permissionModeBySession,
   ]);
 
@@ -1208,14 +1700,317 @@ export default function AppShell() {
     [activeSession, permissionModeBySession],
   );
 
+  const handleModelSelection = useCallback(
+    async (modelId: string) => {
+      const agentForModel = MODEL_LOOKUP.agentById.get(modelId);
+      if (!agentForModel) {
+        return;
+      }
+      if (activeSession) {
+        if (activeSession.agentType !== agentForModel) {
+          return;
+        }
+        const previousModel = activeSession.model ?? null;
+        setSessionsByWorkspace((prev) => {
+          const list = prev[activeSession.workspaceId] ?? [];
+          return {
+            ...prev,
+            [activeSession.workspaceId]: list.map((session) =>
+              session.id === activeSession.id
+                ? { ...session, model: modelId }
+                : session,
+            ),
+          };
+        });
+        try {
+          await invoke('updateSessionModel', {
+            sessionId: activeSession.id,
+            model: modelId,
+          });
+        } catch (err) {
+          setSendError(String(err));
+          setSessionsByWorkspace((prev) => {
+            const list = prev[activeSession.workspaceId] ?? [];
+            return {
+              ...prev,
+              [activeSession.workspaceId]: list.map((session) =>
+                session.id === activeSession.id
+                  ? { ...session, model: previousModel }
+                  : session,
+              ),
+            };
+          });
+        }
+        return;
+      }
+      setNewChatAgentType(agentForModel);
+      setNewChatModelByAgent((prev) => ({
+        ...prev,
+        [agentForModel]: modelId,
+      }));
+    },
+    [activeSession],
+  );
+
+  const resetComposerSuggestions = useCallback(() => {
+      setComposerSuggestions([]);
+      setComposerSuggestionIndex(0);
+      setComposerSuggestionRange(null);
+  }, []);
+
+  const updateComposerSuggestions = useCallback(
+    (value: string, cursor: number) => {
+      const before = value.slice(0, cursor);
+      const mentionMatch = /(^|\s)@([^\s]*)$/.exec(before);
+      if (mentionMatch) {
+        const query = mentionMatch[2] ?? '';
+        const start = cursor - query.length - 1;
+        const queryLower = query.toLowerCase();
+        const matches = workspaceFiles
+          .filter((path) => path.toLowerCase().includes(queryLower))
+          .slice(0, 8)
+          .map((path) => ({
+            id: `mention-${path}`,
+            label: path,
+            value: `@${path}`,
+            mode: 'mention' as const,
+            description: 'File',
+          }));
+        setComposerSuggestions(matches);
+        setComposerSuggestionIndex(0);
+        setComposerSuggestionRange({ start, end: cursor });
+        return;
+      }
+      const slashMatch = /(^|\s)\/([^\s]*)$/.exec(before);
+      if (slashMatch) {
+        const query = slashMatch[2] ?? '';
+        const start = cursor - query.length - 1;
+        const queryLower = query.toLowerCase();
+        const uniqueCommands = Array.from(new Set(slashCommands));
+        const matches = uniqueCommands
+          .filter((command) => command.toLowerCase().includes(queryLower))
+          .slice(0, 8)
+          .map((command) => ({
+            id: `slash-${command}`,
+            label: `/${command}`,
+            value: `/${command}`,
+            mode: 'slash' as const,
+            description: 'Command',
+          }));
+        setComposerSuggestions(matches);
+        setComposerSuggestionIndex(0);
+        setComposerSuggestionRange({ start, end: cursor });
+        return;
+      }
+      resetComposerSuggestions();
+    },
+    [resetComposerSuggestions, slashCommands, workspaceFiles],
+  );
+
+  const applyComposerSuggestion = useCallback(
+    (suggestion: ComposerSuggestion) => {
+      if (!composerSuggestionRange) {
+        return;
+      }
+      const start = composerSuggestionRange.start;
+      const end = composerSuggestionRange.end;
+      const nextValue =
+        composerValue.slice(0, start) +
+        suggestion.value +
+        composerValue.slice(end);
+      setComposerValue(nextValue);
+      resetComposerSuggestions();
+      requestAnimationFrame(() => {
+        if (!composerRef.current) {
+          return;
+        }
+        const cursor = start + suggestion.value.length;
+        composerRef.current.focus();
+        composerRef.current.setSelectionRange(cursor, cursor);
+      });
+    },
+    [composerSuggestionRange, composerValue, resetComposerSuggestions],
+  );
+
+  const handleComposerChange = useCallback(
+    (event: React.ChangeEvent<HTMLTextAreaElement>) => {
+      const nextValue = event.target.value;
+      setComposerValue(nextValue);
+      const cursor = event.target.selectionStart ?? nextValue.length;
+      updateComposerSuggestions(nextValue, cursor);
+    },
+    [updateComposerSuggestions],
+  );
+
   const handleComposerKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (composerSuggestions.length > 0 && composerSuggestionRange) {
+        if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          setComposerSuggestionIndex((prev) =>
+            Math.min(prev + 1, composerSuggestions.length - 1),
+          );
+          return;
+        }
+        if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          setComposerSuggestionIndex((prev) => Math.max(prev - 1, 0));
+          return;
+        }
+        if (event.key === 'Tab' || event.key === 'Enter') {
+          event.preventDefault();
+          const selected =
+            composerSuggestions[composerSuggestionIndex] ??
+            composerSuggestions[0];
+          if (selected) {
+            applyComposerSuggestion(selected);
+          }
+          return;
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          resetComposerSuggestions();
+          return;
+        }
+      }
       if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
         void handleSendMessage();
       }
     },
-    [handleSendMessage],
+    [
+      applyComposerSuggestion,
+      composerSuggestionIndex,
+      composerSuggestionRange,
+      composerSuggestions,
+      handleSendMessage,
+      resetComposerSuggestions,
+    ],
+  );
+
+  const handleAddAttachments = useCallback(
+    async (files: FileList | File[]) => {
+      if (!activeWorkspaceId) {
+        return;
+      }
+      const nextFiles = Array.from(files ?? []);
+      if (nextFiles.length === 0) {
+        return;
+      }
+      let session = activeSession;
+      if (!session) {
+        try {
+          session = await createSessionForWorkspace(
+            activeWorkspaceId,
+            newChatAgentType,
+            newChatModelByAgent[newChatAgentType] ??
+              getDefaultModel(newChatAgentType),
+          );
+        } catch {
+          return;
+        }
+      }
+      for (const file of nextFiles) {
+        const buffer = await file.arrayBuffer();
+        const bytes = Array.from(new Uint8Array(buffer));
+        try {
+          const attachment = await invoke<AttachmentRecord>('createAttachment', {
+            sessionId: session.id,
+            fileName: file.name,
+            mimeType: file.type || undefined,
+            bytes,
+          });
+          setDraftAttachmentsBySession((prev) => {
+            const existing = prev[session.id] ?? [];
+            return {
+              ...prev,
+              [session.id]: [...existing, attachment],
+            };
+          });
+        } catch (err) {
+          setSendError(String(err));
+        }
+      }
+    },
+    [
+      activeSession,
+      activeWorkspaceId,
+      createSessionForWorkspace,
+      newChatAgentType,
+      newChatModelByAgent,
+    ],
+  );
+
+  const handleRemoveDraftAttachment = useCallback(
+    async (sessionId: string, attachmentId: string) => {
+      try {
+        await invoke('deleteAttachment', { attachmentId });
+        setDraftAttachmentsBySession((prev) => {
+          const existing = prev[sessionId] ?? [];
+          return {
+            ...prev,
+            [sessionId]: existing.filter((item) => item.id !== attachmentId),
+          };
+        });
+      } catch (err) {
+        setSendError(String(err));
+      }
+    },
+    [],
+  );
+
+  const handleSaveLinkedIssue = useCallback(() => {
+    const trimmed = linkIssueValue.trim();
+    if (!trimmed) {
+      setLinkIssueOpen(false);
+      setLinkIssueValue('');
+      return;
+    }
+    if (activeSession) {
+      setLinkedIssueBySession((prev) => ({
+        ...prev,
+        [activeSession.id]: trimmed,
+      }));
+    } else {
+      setPendingIssueId(trimmed);
+    }
+    setLinkIssueOpen(false);
+    setLinkIssueValue('');
+  }, [activeSession, linkIssueValue]);
+
+  const handleCopyMessage = useCallback(async (content: string) => {
+    try {
+      await navigator.clipboard.writeText(content);
+    } catch {
+      return;
+    }
+  }, []);
+
+  const handleComposerDragOver = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      if (!composerDragActive) {
+        setComposerDragActive(true);
+      }
+    },
+    [composerDragActive],
+  );
+
+  const handleComposerDragLeave = useCallback(() => {
+    if (composerDragActive) {
+      setComposerDragActive(false);
+    }
+  }, [composerDragActive]);
+
+  const handleComposerDrop = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      setComposerDragActive(false);
+      if (event.dataTransfer?.files?.length) {
+        void handleAddAttachments(event.dataTransfer.files);
+      }
+    },
+    [handleAddAttachments],
   );
 
   const handleResolveAskUserQuestion = useCallback(async () => {
@@ -1343,6 +2138,11 @@ export default function AppShell() {
         setFileOpenerOpen(true);
         return;
       }
+      if (primary && key === 'i') {
+        event.preventDefault();
+        setLinkIssueOpen(true);
+        return;
+      }
       if (primary && key === 't') {
         event.preventDefault();
         handleNewChat();
@@ -1421,18 +2221,25 @@ export default function AppShell() {
     if (!activeWorkspaceId) {
       return;
     }
-    if (activeSessionByWorkspace[activeWorkspaceId]) {
+    const openIds = openSessionIdsByWorkspace[activeWorkspaceId] ?? [];
+    const activeId = activeSessionByWorkspace[activeWorkspaceId] ?? null;
+    if (openIds.length === 0) {
+      if (activeId) {
+        setActiveSessionByWorkspace((prev) => ({
+          ...prev,
+          [activeWorkspaceId]: null,
+        }));
+      }
       return;
     }
-    const sessions = sessionsByWorkspace[activeWorkspaceId] ?? [];
-    if (sessions.length === 0) {
+    if (activeId && openIds.includes(activeId)) {
       return;
     }
     setActiveSessionByWorkspace((prev) => ({
       ...prev,
-      [activeWorkspaceId]: sessions[sessions.length - 1].id,
+      [activeWorkspaceId]: openIds[openIds.length - 1],
     }));
-  }, [activeSessionByWorkspace, activeWorkspaceId, sessionsByWorkspace]);
+  }, [activeSessionByWorkspace, activeWorkspaceId, openSessionIdsByWorkspace]);
 
   useEffect(() => {
     setFileListVisibleCount(20);
@@ -1666,7 +2473,8 @@ export default function AppShell() {
         ? repos.find((repo) => repo.id === workspace.repoId)?.name ?? 'Repository'
         : 'Workspace';
       const title = session.title ?? 'Chat';
-      const modelLabel = session.model ?? formatAgentLabel(session.agentType);
+      const modelLabel =
+        getModelLabel(session.model) ?? formatAgentLabel(session.agentType);
       const label = workspace ? `${title}` : title;
       const description = workspace
         ? `${repoName} · ${workspace.branch} · ${modelLabel}`
@@ -1962,6 +2770,159 @@ export default function AppShell() {
   }, [activeExitRequest, handleResolveExitPlanMode]);
 
   useEffect(() => {
+    if (!historyOpen) {
+      return;
+    }
+    const modal = historyRef.current;
+    if (!modal) {
+      return;
+    }
+
+    const getFocusable = () =>
+      Array.from(
+        modal.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hasAttribute('disabled'));
+
+    const focusables = getFocusable();
+    if (focusables.length > 0) {
+      focusables[0].focus();
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setHistoryOpen(false);
+        return;
+      }
+      if (event.key !== 'Tab') {
+        return;
+      }
+      const items = getFocusable();
+      if (items.length === 0) {
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [historyOpen]);
+
+  useEffect(() => {
+    if (!linkIssueOpen) {
+      return;
+    }
+    const modal = linkIssueRef.current;
+    if (!modal) {
+      return;
+    }
+
+    const getFocusable = () =>
+      Array.from(
+        modal.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hasAttribute('disabled'));
+
+    const focusables = getFocusable();
+    if (focusables.length > 0) {
+      focusables[0].focus();
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setLinkIssueOpen(false);
+        return;
+      }
+      if (event.key !== 'Tab') {
+        return;
+      }
+      const items = getFocusable();
+      if (items.length === 0) {
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [linkIssueOpen]);
+
+  useEffect(() => {
+    if (!newChatOpen) {
+      return;
+    }
+    const modal = newChatRef.current;
+    if (!modal) {
+      return;
+    }
+
+    const getFocusable = () =>
+      Array.from(
+        modal.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hasAttribute('disabled'));
+
+    const focusables = getFocusable();
+    if (focusables.length > 0) {
+      focusables[0].focus();
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setNewChatOpen(false);
+        return;
+      }
+      if (event.key !== 'Tab') {
+        return;
+      }
+      const items = getFocusable();
+      if (items.length === 0) {
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [newChatOpen]);
+
+  useEffect(() => {
     if (!workspaceMenuId) {
       return;
     }
@@ -2233,12 +3194,12 @@ export default function AppShell() {
                 const isActive =
                   activeTab === 'session' && activeSessionId === session.id;
                 const title = session.title ?? 'Chat';
-                const modelLabel = session.model ?? formatAgentLabel(session.agentType);
+                const modelLabel =
+                  getModelLabel(session.model) ??
+                  formatAgentLabel(session.agentType);
                 return (
-                  <button
+                  <div
                     key={session.id}
-                    type="button"
-                    onClick={() => handleSelectSession(session.workspaceId, session.id)}
                     onMouseDown={(event) => {
                       if (event.button === 1) {
                         event.preventDefault();
@@ -2251,11 +3212,30 @@ export default function AppShell() {
                         : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
                     }`}
                   >
-                    <span className="truncate">{title}</span>
-                    <span className="text-[10px] uppercase tracking-widest text-slate-500">
-                      {modelLabel}
-                    </span>
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleSelectSession(session.workspaceId, session.id)
+                      }
+                      className="flex items-center gap-2 truncate"
+                    >
+                      <span className="truncate">{title}</span>
+                      <span className="text-[10px] uppercase tracking-widest text-slate-500">
+                        {modelLabel}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleCloseSession(session.workspaceId, session.id);
+                      }}
+                      className="text-slate-500 transition hover:text-slate-100"
+                      aria-label="Close chat"
+                    >
+                      ×
+                    </button>
+                  </div>
                 );
               })}
               <button
@@ -2292,6 +3272,7 @@ export default function AppShell() {
                 <TooltipTrigger asChild>
                   <button
                     type="button"
+                    onClick={() => setHistoryOpen(true)}
                     className="rounded-md border border-slate-800 px-3 py-1.5 text-xs text-slate-400 transition hover:bg-slate-900 hover:text-slate-100"
                   >
                     History
@@ -2454,18 +3435,32 @@ export default function AppShell() {
                           <div className="mt-2 text-sm text-slate-200">
                             {(activeSession.title ?? 'Chat')}{' '}
                             <span className="text-xs uppercase tracking-widest text-slate-500">
-                              {activeSession.model ?? formatAgentLabel(activeSession.agentType)}
+                              {getModelLabel(activeSession.model) ??
+                                formatAgentLabel(activeSession.agentType)}
                             </span>
                           </div>
                           <div className="mt-2 text-xs text-slate-500">
                             Status: {activeSessionStatus}
                             {activePlanMode ? ' · Plan mode' : ''}
                           </div>
+                          {linkedIssueBySession[activeSession.id] ? (
+                            <div className="mt-2 text-xs text-slate-500">
+                              Linked issue:{' '}
+                              <span className="text-slate-200">
+                                {linkedIssueBySession[activeSession.id]}
+                              </span>
+                            </div>
+                          ) : null}
                         </div>
                         <div className="flex items-center gap-2 text-xs text-slate-500">
                           <span className="rounded-full border border-slate-800 px-2 py-1 uppercase tracking-widest">
                             {activeSession.agentType}
                           </span>
+                          {contextUsagePercent !== null ? (
+                            <span className="rounded-full border border-slate-800 px-2 py-1 uppercase tracking-widest">
+                              Context {contextUsagePercent}%
+                            </span>
+                          ) : null}
                         </div>
                       </div>
                       {activeSessionError ? (
@@ -2511,8 +3506,34 @@ export default function AppShell() {
                                   }),
                                 ) as Record<string, number>)
                               : null;
-                          const hasToolSummary =
-                            toolSummary && Object.keys(toolSummary).length > 0;
+                          const toolEntries = toolSummary
+                            ? Object.entries(toolSummary)
+                            : [];
+                          const diffStatRaw =
+                            message.metadata &&
+                            typeof message.metadata === 'object' &&
+                            'diffStat' in message.metadata
+                              ? (message.metadata as Record<string, unknown>)['diffStat']
+                              : null;
+                          const diffStat =
+                            typeof diffStatRaw === 'string' ? diffStatRaw : null;
+                          const diffLines = diffStat
+                            ? diffStat
+                                .trim()
+                                .split('\n')
+                                .filter((line) => line.trim().length > 0)
+                            : [];
+                          const diffSummary =
+                            diffLines.length > 0
+                              ? diffLines[diffLines.length - 1]
+                              : null;
+                          const diffFiles =
+                            diffLines.length > 1
+                              ? diffLines.slice(0, -1)
+                              : [];
+                          const attachments = activeSessionAttachments.filter(
+                            (item) => item.sessionMessageId === message.id,
+                          );
                           return (
                             <div
                               key={message.id}
@@ -2523,20 +3544,73 @@ export default function AppShell() {
                               }`}
                             >
                               <div className="flex items-center justify-between text-[11px] uppercase tracking-widest text-slate-500">
-                                <span>{message.role}</span>
-                                {message.streaming ? (
-                                  <span className="text-emerald-400">Streaming…</span>
-                                ) : null}
+                                <div className="flex items-center gap-2">
+                                  <span>{message.role}</span>
+                                  {message.streaming ? (
+                                    <span className="text-emerald-400">Streaming…</span>
+                                  ) : null}
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => handleCopyMessage(message.content)}
+                                  className="rounded-md border border-slate-800 px-2 py-1 text-[10px] uppercase tracking-widest text-slate-500 transition hover:bg-slate-900 hover:text-slate-100"
+                                >
+                                  Copy
+                                </button>
                               </div>
-                              <pre className="mt-2 whitespace-pre-wrap text-sm text-slate-100">
-                                {message.content}
-                              </pre>
-                              {hasToolSummary ? (
-                                <div className="mt-3 text-xs text-slate-500">
-                                  Tools:{' '}
-                                  {Object.entries(toolSummary)
-                                    .map(([tool, count]) => `${tool} (${count})`)
-                                    .join(', ')}
+                              <div className="mt-2 space-y-2">
+                                {renderMarkdownContent(
+                                  message.content,
+                                  workspaceFileSet,
+                                  (path) => {
+                                    if (activeWorkspaceId) {
+                                      void handleOpenFile(activeWorkspaceId, path);
+                                    }
+                                  },
+                                )}
+                              </div>
+                              {attachments.length > 0 ? (
+                                <div className="mt-3 flex flex-wrap gap-2">
+                                  {attachments.map((attachment) => (
+                                    <span
+                                      key={attachment.id}
+                                      className="inline-flex items-center gap-1 rounded-full border border-slate-800 px-2 py-1 text-[11px] text-slate-300"
+                                    >
+                                      📎{' '}
+                                      {attachment.title ??
+                                        attachment.path ??
+                                        'Attachment'}
+                                    </span>
+                                  ))}
+                                </div>
+                              ) : null}
+                              {toolEntries.length > 0 ? (
+                                <div className="mt-3 flex flex-wrap gap-2">
+                                  {toolEntries.map(([tool, count]) => (
+                                    <span
+                                      key={tool}
+                                      className="rounded-full border border-slate-800 px-2 py-1 text-[11px] text-slate-400"
+                                    >
+                                      {tool} · {count}
+                                    </span>
+                                  ))}
+                                </div>
+                              ) : null}
+                              {message.role === 'assistant' && diffStat ? (
+                                <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-400">
+                                  <div className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
+                                    Files changed
+                                  </div>
+                                  {diffSummary ? (
+                                    <div className="mt-1 text-slate-300">
+                                      {diffSummary}
+                                    </div>
+                                  ) : null}
+                                  {diffFiles.length > 0 ? (
+                                    <pre className="mt-2 whitespace-pre-wrap text-[11px] text-slate-500">
+                                      {diffFiles.join('\n')}
+                                    </pre>
+                                  ) : null}
                                 </div>
                               ) : null}
                             </div>
@@ -2594,13 +3668,26 @@ export default function AppShell() {
                   ? 'Running'
                   : 'Ready'
                 : 'Select a workspace to start'}
+              {contextUsagePercent !== null ? ` · Context ${contextUsagePercent}%` : ''}
             </span>
           </div>
-          <div className="mt-3 space-y-3">
+          <div
+            className="relative mt-3 space-y-3"
+            onDragOver={handleComposerDragOver}
+            onDragLeave={handleComposerDragLeave}
+            onDrop={handleComposerDrop}
+          >
+            {composerDragActive ? (
+              <div className="absolute inset-0 z-10 flex items-center justify-center rounded-md border-2 border-dashed border-slate-700 bg-slate-950/90 text-sm text-slate-200">
+                Drop files to attach
+              </div>
+            ) : null}
             <textarea
+              ref={composerRef}
               value={composerValue}
-              onChange={(event) => setComposerValue(event.target.value)}
+              onChange={handleComposerChange}
               onKeyDown={handleComposerKeyDown}
+              onBlur={resetComposerSuggestions}
               disabled={!activeWorkspaceId}
               rows={3}
               placeholder={
@@ -2610,6 +3697,57 @@ export default function AppShell() {
               }
               className="w-full resize-none rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 disabled:cursor-not-allowed disabled:text-slate-600"
             />
+            {composerSuggestions.length > 0 ? (
+              <div className="rounded-md border border-slate-800 bg-slate-950/90 p-2">
+                <div className="space-y-1">
+                  {composerSuggestions.map((suggestion, index) => (
+                    <button
+                      key={suggestion.id}
+                      type="button"
+                      onClick={() => applyComposerSuggestion(suggestion)}
+                      className={`flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-xs transition ${
+                        index === composerSuggestionIndex
+                          ? 'bg-slate-800 text-slate-100'
+                          : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                      }`}
+                    >
+                      <span>{suggestion.label}</span>
+                      <span className="text-[10px] uppercase tracking-widest text-slate-500">
+                        {suggestion.description}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {activeDraftAttachments.length > 0 ? (
+              <div className="flex flex-wrap gap-2">
+                {activeDraftAttachments.map((attachment) => (
+                  <div
+                    key={attachment.id}
+                    className="inline-flex items-center gap-2 rounded-full border border-slate-800 px-2 py-1 text-[11px] text-slate-300"
+                  >
+                    <span>
+                      📎 {attachment.title ?? attachment.path ?? 'Attachment'}
+                    </span>
+                    {activeSessionId ? (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleRemoveDraftAttachment(
+                            activeSessionId,
+                            attachment.id,
+                          )
+                        }
+                        className="text-slate-500 transition hover:text-slate-200"
+                      >
+                        ✕
+                      </button>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : null}
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500">
                 {activeSession ? (
@@ -2627,12 +3765,40 @@ export default function AppShell() {
                     </span>
                   </span>
                 )}
+                <label className="flex items-center gap-2 text-[11px] uppercase tracking-widest text-slate-500">
+                  Model
+                  <select
+                    value={selectedModelId ?? ''}
+                    onChange={(event) => handleModelSelection(event.target.value)}
+                    className="rounded-md border border-slate-800 bg-slate-950 px-2 py-1 text-[11px] uppercase tracking-widest text-slate-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500"
+                  >
+                  {modelGroupsForSelection.map((group) => (
+                    <optgroup key={group.id} label={group.label}>
+                      {group.models.map((model) => (
+                        <option
+                          key={model.id}
+                          value={model.id}
+                          disabled={
+                            activeSession
+                              ? activeSession.agentType !== group.id
+                              : false
+                          }
+                        >
+                          {model.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                  </select>
+                </label>
                 {activeSession?.agentType === 'claude' ? (
                   <label className="flex items-center gap-2 text-[11px] uppercase tracking-widest text-slate-500">
                     Permission
                     <select
                       value={activePermissionMode}
-                      onChange={(event) => handlePermissionModeChange(event.target.value)}
+                      onChange={(event) =>
+                        handlePermissionModeChange(event.target.value)
+                      }
                       className="rounded-md border border-slate-800 bg-slate-950 px-2 py-1 text-[11px] uppercase tracking-widest text-slate-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500"
                     >
                       <option value="default">Default</option>
@@ -2646,6 +3812,33 @@ export default function AppShell() {
                 ) : null}
               </div>
               <div className="flex items-center gap-2">
+                <input
+                  ref={attachmentInputRef}
+                  type="file"
+                  multiple
+                  className="hidden"
+                  onChange={(event) => {
+                    const files = event.target.files;
+                    if (files && files.length > 0) {
+                      void handleAddAttachments(files);
+                    }
+                    event.target.value = '';
+                  }}
+                />
+                <Button
+                  variant="outline"
+                  onClick={() => attachmentInputRef.current?.click()}
+                  disabled={!activeWorkspaceId}
+                >
+                  📎 Attach
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => setLinkIssueOpen(true)}
+                  disabled={!activeWorkspaceId}
+                >
+                  Link issue
+                </Button>
                 {canCancelSession ? (
                   <Button variant="outline" onClick={handleCancelSession}>
                     Stop
@@ -3064,6 +4257,228 @@ export default function AppShell() {
                 Reject
               </Button>
               <Button onClick={() => handleResolveExitPlanMode(true)}>Approve</Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {historyOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-6">
+          <div
+            ref={historyRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="history-title"
+            className="w-full max-w-lg rounded-lg border border-slate-800 bg-slate-950 p-6 shadow-2xl"
+          >
+            <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+              History
+            </div>
+            <h2 id="history-title" className="mt-2 text-xl font-semibold">
+              Closed chats
+            </h2>
+            <p className="mt-3 text-sm text-slate-400">
+              Reopen a recently closed tab for this workspace.
+            </p>
+            {closedSessions.length > 0 ? (
+              <div className="mt-4 space-y-2">
+                {closedSessions.map((session) => (
+                  <button
+                    key={session.id}
+                    type="button"
+                    onClick={() => {
+                      handleSelectSession(session.workspaceId, session.id);
+                      setHistoryOpen(false);
+                    }}
+                    className="flex w-full items-center justify-between rounded-md border border-slate-800 px-3 py-2 text-left text-sm text-slate-200 transition hover:bg-slate-900"
+                  >
+                    <span>
+                      {session.title ?? 'Chat'}{' '}
+                      <span className="text-xs uppercase tracking-widest text-slate-500">
+                        {getModelLabel(session.model) ??
+                          formatAgentLabel(session.agentType)}
+                      </span>
+                    </span>
+                    <span className="text-[10px] uppercase tracking-widest text-slate-500">
+                      {session.agentType}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="mt-4 text-sm text-slate-500">
+                No recently closed chats.
+              </div>
+            )}
+            <div className="mt-6 flex items-center justify-end">
+              <Button variant="outline" onClick={() => setHistoryOpen(false)}>
+                Close
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {linkIssueOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-6">
+          <div
+            ref={linkIssueRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="link-issue-title"
+            className="w-full max-w-md rounded-lg border border-slate-800 bg-slate-950 p-6 shadow-2xl"
+          >
+            <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+              Issue
+            </div>
+            <h2 id="link-issue-title" className="mt-2 text-xl font-semibold">
+              Link issue
+            </h2>
+            <p className="mt-3 text-sm text-slate-400">
+              Attach an issue ID or URL to this chat.
+            </p>
+            <input
+              value={linkIssueValue}
+              onChange={(event) => setLinkIssueValue(event.target.value)}
+              placeholder="e.g. M07-14 or https://github.com/org/repo/issues/14"
+              className="mt-4 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500"
+            />
+            <div className="mt-6 flex items-center justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setLinkIssueOpen(false);
+                  setLinkIssueValue('');
+                }}
+              >
+                Cancel
+              </Button>
+              <Button onClick={handleSaveLinkedIssue}>Save</Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {newChatOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-6">
+          <div
+            ref={newChatRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="new-chat-title"
+            className="w-full max-w-lg rounded-lg border border-slate-800 bg-slate-950 p-6 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                  Chat
+                </div>
+                <h2 id="new-chat-title" className="mt-2 text-xl font-semibold">
+                  New chat
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setNewChatOpen(false)}
+                className="text-sm text-slate-400 hover:text-slate-100"
+              >
+                Close
+              </button>
+            </div>
+            <div className="mt-4 space-y-4">
+              <div>
+                <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                  Agent
+                </div>
+                <div className="mt-2 flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setNewChatAgentType('claude')}
+                    className={`rounded-md px-3 py-2 text-sm transition ${
+                      newChatAgentType === 'claude'
+                        ? 'bg-slate-800 text-slate-100'
+                        : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                    }`}
+                  >
+                    Claude
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setNewChatAgentType('codex')}
+                    className={`rounded-md px-3 py-2 text-sm transition ${
+                      newChatAgentType === 'codex'
+                        ? 'bg-slate-800 text-slate-100'
+                        : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                    }`}
+                  >
+                    Codex
+                  </button>
+                </div>
+              </div>
+              <label className="block text-xs uppercase tracking-[0.3em] text-slate-500">
+                Model
+                <select
+                  value={
+                    newChatModelByAgent[newChatAgentType] ??
+                    getDefaultModel(newChatAgentType) ??
+                    ''
+                  }
+                  onChange={(event) => {
+                    const modelId = event.target.value;
+                    const agentForModel =
+                      MODEL_LOOKUP.agentById.get(modelId) ?? newChatAgentType;
+                    setNewChatAgentType(agentForModel);
+                    setNewChatModelByAgent((prev) => ({
+                      ...prev,
+                      [agentForModel]: modelId,
+                    }));
+                  }}
+                  className="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500"
+                >
+                  {MODEL_GROUPS.map((group) => (
+                    <optgroup key={group.id} label={group.label}>
+                      {group.models.map((model) => (
+                        <option key={model.id} value={model.id}>
+                          {model.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </select>
+              </label>
+              <div>
+                <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                  Context
+                </div>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {recentSessions.length > 0 ? (
+                    recentSessions.map((session) => (
+                      <button
+                        key={session.id}
+                        type="button"
+                        onClick={() => toggleNewChatContext(session.id)}
+                        className={`rounded-full border px-3 py-1 text-xs transition ${
+                          newChatContextIds.includes(session.id)
+                            ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                            : 'border-slate-800 text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                        }`}
+                      >
+                        {session.title ?? 'Chat'}
+                      </button>
+                    ))
+                  ) : (
+                    <div className="text-xs text-slate-500">
+                      No recent chats.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+            <div className="mt-6 flex items-center justify-end gap-2">
+              <Button variant="outline" onClick={() => setNewChatOpen(false)}>
+                Cancel
+              </Button>
+              <Button onClick={handleStartNewChat}>Start chat</Button>
             </div>
           </div>
         </div>
