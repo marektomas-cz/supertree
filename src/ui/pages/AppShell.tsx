@@ -1,13 +1,75 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import CommandPalette, { type CommandPaletteItem } from '@/components/CommandPalette';
+import FileOpener from '@/components/FileOpener';
 import { Button } from '@/components/ui/button';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
 import { formatGreeting } from '@/lib/format';
 import type { OpenTarget, RepoInfo } from '@/types/repo';
-import type { WorkspaceInfo } from '@/types/workspace';
+import type { FilePreview, WorkspaceInfo } from '@/types/workspace';
 import RepositoryPage from './RepositoryPage';
 import SettingsPage from './SettingsPage';
-import WorkspacePage from './WorkspacePage';
 import WorkspacesPage from './WorkspacesPage';
+
+type ChatSession = {
+  id: string;
+  workspaceId: string;
+  title: string;
+  model: string;
+};
+
+const STORAGE_KEYS = {
+  leftVisible: 'supertree.leftSidebarVisible',
+  rightVisible: 'supertree.rightSidebarVisible',
+  leftWidth: 'supertree.leftSidebarWidth',
+  rightWidth: 'supertree.rightSidebarWidth',
+  zenMode: 'supertree.zenMode',
+};
+
+const readBoolean = (key: string, fallback: boolean) => {
+  if (typeof window === 'undefined') {
+    return fallback;
+  }
+  const value = window.localStorage.getItem(key);
+  if (value === null) {
+    return fallback;
+  }
+  return value === 'true';
+};
+
+const readNumber = (key: string, fallback: number) => {
+  if (typeof window === 'undefined') {
+    return fallback;
+  }
+  const value = window.localStorage.getItem(key);
+  if (value === null) {
+    return fallback;
+  }
+  const parsed = Number(value);
+  return Number.isNaN(parsed) ? fallback : parsed;
+};
+
+const clamp = (value: number, min: number, max: number) =>
+  Math.min(max, Math.max(min, value));
+
+const DIFF_PLACEHOLDER = `diff --git a/src/main.tsx b/src/main.tsx
+index 5b8c3d2..c19b2e1 100644
+--- a/src/main.tsx
++++ b/src/main.tsx
+@@ -12,6 +12,8 @@ export function Main() {
+   return (
+     <section className="app">
++      <h1>Workspace changes</h1>
++      <p>Preview shows unified diff output.</p>
+       <Composer />
+     </section>
+   );
+ }`;
 
 /**
  * Top-level shell layout with left navigation and main content area.
@@ -15,7 +77,7 @@ import WorkspacesPage from './WorkspacesPage';
 export default function AppShell() {
   const [activeView, setActiveView] = useState<
     'home' | 'settings' | 'repo' | 'workspaces' | 'workspace'
-  >('settings');
+  >('home');
   const [greeting, setGreeting] = useState<string>(formatGreeting('Supertree'));
   const [error, setError] = useState<string | null>(null);
   const [repos, setRepos] = useState<RepoInfo[]>([]);
@@ -52,6 +114,46 @@ export default function AppShell() {
   );
   const [archiveConfirmScript, setArchiveConfirmScript] = useState<string | null>(null);
   const archiveConfirmRef = useRef<HTMLDivElement>(null);
+  const [leftSidebarVisible, setLeftSidebarVisible] = useState(() =>
+    readBoolean(STORAGE_KEYS.leftVisible, true),
+  );
+  const [rightSidebarVisible, setRightSidebarVisible] = useState(() =>
+    readBoolean(STORAGE_KEYS.rightVisible, true),
+  );
+  const [zenMode, setZenMode] = useState(() =>
+    readBoolean(STORAGE_KEYS.zenMode, false),
+  );
+  const [leftSidebarWidth, setLeftSidebarWidth] = useState(() =>
+    readNumber(STORAGE_KEYS.leftWidth, 280),
+  );
+  const [rightSidebarWidth, setRightSidebarWidth] = useState(() =>
+    readNumber(STORAGE_KEYS.rightWidth, 320),
+  );
+  const leftResizeState = useRef<{ startX: number; startWidth: number } | null>(null);
+  const rightResizeState = useRef<{ startX: number; startWidth: number } | null>(null);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [fileOpenerOpen, setFileOpenerOpen] = useState(false);
+  const [fileListError, setFileListError] = useState<string | null>(null);
+  const [filePreviewError, setFilePreviewError] = useState<string | null>(null);
+  const [filesByWorkspace, setFilesByWorkspace] = useState<Record<string, string[]>>({});
+  const [recentFilesByWorkspace, setRecentFilesByWorkspace] = useState<
+    Record<string, string[]>
+  >({});
+  const [filePreviewByWorkspace, setFilePreviewByWorkspace] = useState<
+    Record<string, FilePreview | null>
+  >({});
+  const [sessionsByWorkspace, setSessionsByWorkspace] = useState<
+    Record<string, ChatSession[]>
+  >({});
+  const [activeSessionByWorkspace, setActiveSessionByWorkspace] = useState<
+    Record<string, string | null>
+  >({});
+  const [activeTabByWorkspace, setActiveTabByWorkspace] = useState<
+    Record<string, 'changes' | 'session'>
+  >({});
+  const [rightPanelTab, setRightPanelTab] = useState<'run' | 'terminal'>('run');
+  const [gitPanelTab, setGitPanelTab] = useState<'changes' | 'files'>('changes');
+  const [fileListVisibleCount, setFileListVisibleCount] = useState(20);
 
   const selectedRepo = useMemo(
     () => repos.find((repo) => repo.id === selectedRepoId) ?? null,
@@ -67,6 +169,53 @@ export default function AppShell() {
     }
     return repos.find((repo) => repo.id === selectedWorkspace.repoId) ?? null;
   }, [repos, selectedWorkspace]);
+  const activeWorkspaceId = selectedWorkspace?.id ?? null;
+  const activeSessions = useMemo(() => {
+    if (!activeWorkspaceId) {
+      return [];
+    }
+    return sessionsByWorkspace[activeWorkspaceId] ?? [];
+  }, [activeWorkspaceId, sessionsByWorkspace]);
+  const activeSessionId = useMemo(() => {
+    if (!activeWorkspaceId) {
+      return null;
+    }
+    return activeSessionByWorkspace[activeWorkspaceId] ?? null;
+  }, [activeSessionByWorkspace, activeWorkspaceId]);
+  const activeTab = useMemo(() => {
+    if (!activeWorkspaceId) {
+      return 'changes';
+    }
+    return activeTabByWorkspace[activeWorkspaceId] ?? 'changes';
+  }, [activeTabByWorkspace, activeWorkspaceId]);
+  const workspaceFiles = useMemo(() => {
+    if (!activeWorkspaceId) {
+      return [];
+    }
+    return filesByWorkspace[activeWorkspaceId] ?? [];
+  }, [activeWorkspaceId, filesByWorkspace]);
+  const recentFiles = useMemo(() => {
+    if (!activeWorkspaceId) {
+      return [];
+    }
+    return recentFilesByWorkspace[activeWorkspaceId] ?? [];
+  }, [activeWorkspaceId, recentFilesByWorkspace]);
+  const filePreview = useMemo(() => {
+    if (!activeWorkspaceId) {
+      return null;
+    }
+    return filePreviewByWorkspace[activeWorkspaceId] ?? null;
+  }, [activeWorkspaceId, filePreviewByWorkspace]);
+  const visibleFileCount = Math.min(fileListVisibleCount, workspaceFiles.length);
+  const fileListIsTruncated = workspaceFiles.length > visibleFileCount;
+  const showLeftSidebar = leftSidebarVisible && !zenMode;
+  const showRightSidebar = rightSidebarVisible && !zenMode;
+  const isMac = useMemo(
+    () =>
+      typeof navigator !== 'undefined' &&
+      /Mac|iPhone|iPod|iPad/i.test(navigator.platform),
+    [],
+  );
   const workspacesByRepo = useMemo(() => {
     const grouped = new Map<string, WorkspaceInfo[]>();
     for (const workspace of workspaces) {
@@ -186,6 +335,60 @@ export default function AppShell() {
     };
   }, [loadWorkspaces]);
 
+  useEffect(() => {
+    window.localStorage.setItem(
+      STORAGE_KEYS.leftVisible,
+      String(leftSidebarVisible),
+    );
+    window.localStorage.setItem(
+      STORAGE_KEYS.rightVisible,
+      String(rightSidebarVisible),
+    );
+    window.localStorage.setItem(STORAGE_KEYS.zenMode, String(zenMode));
+    window.localStorage.setItem(
+      STORAGE_KEYS.leftWidth,
+      String(leftSidebarWidth),
+    );
+    window.localStorage.setItem(
+      STORAGE_KEYS.rightWidth,
+      String(rightSidebarWidth),
+    );
+  }, [
+    leftSidebarVisible,
+    rightSidebarVisible,
+    zenMode,
+    leftSidebarWidth,
+    rightSidebarWidth,
+  ]);
+
+  useEffect(() => {
+    const handleMove = (event: MouseEvent) => {
+      if (leftResizeState.current) {
+        const delta = event.clientX - leftResizeState.current.startX;
+        const nextWidth = clamp(leftResizeState.current.startWidth + delta, 220, 420);
+        setLeftSidebarWidth(nextWidth);
+      }
+      if (rightResizeState.current) {
+        const delta = event.clientX - rightResizeState.current.startX;
+        const nextWidth = clamp(rightResizeState.current.startWidth - delta, 260, 520);
+        setRightSidebarWidth(nextWidth);
+      }
+    };
+    const handleUp = () => {
+      if (leftResizeState.current || rightResizeState.current) {
+        leftResizeState.current = null;
+        rightResizeState.current = null;
+        document.body.style.userSelect = '';
+      }
+    };
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleUp);
+    };
+  }, []);
+
   const handleAddRepo = async () => {
     setAddState('adding');
     setAddError(null);
@@ -262,6 +465,7 @@ export default function AppShell() {
       await loadWorkspaces();
       setSelectedWorkspaceId(workspace.id);
       setActiveView('workspace');
+      setActiveTabByWorkspace((prev) => ({ ...prev, [workspace.id]: 'changes' }));
       closeCreateWorkspace();
     } catch (err) {
       setCreateWorkspaceState('error');
@@ -303,23 +507,231 @@ export default function AppShell() {
     }
   };
 
-  const handleUnreadWorkspace = async (workspaceId: string, unread: boolean) => {
-    setWorkspaceError(null);
-    try {
-      await invoke('markWorkspaceUnread', { workspaceId, unread });
-      await loadWorkspaces();
-    } catch (err) {
-      setWorkspaceError(String(err));
-    }
-  };
+  const handleUnreadWorkspace = useCallback(
+    async (workspaceId: string, unread: boolean) => {
+      setWorkspaceError(null);
+      try {
+        await invoke('markWorkspaceUnread', { workspaceId, unread });
+        await loadWorkspaces();
+      } catch (err) {
+        setWorkspaceError(String(err));
+      }
+    },
+    [loadWorkspaces],
+  );
 
-  const handleSelectWorkspace = async (workspace: WorkspaceInfo) => {
-    setSelectedWorkspaceId(workspace.id);
-    setActiveView('workspace');
-    if (workspace.unread) {
-      await handleUnreadWorkspace(workspace.id, false);
+  const handleSelectWorkspace = useCallback(
+    async (workspace: WorkspaceInfo) => {
+      setSelectedWorkspaceId(workspace.id);
+      setActiveView('workspace');
+      setActiveTabByWorkspace((prev) => ({
+        ...prev,
+        [workspace.id]: prev[workspace.id] ?? 'changes',
+      }));
+      if (workspace.unread) {
+        await handleUnreadWorkspace(workspace.id, false);
+      }
+    },
+    [handleUnreadWorkspace],
+  );
+
+  const toggleLeftSidebar = useCallback(() => {
+    setZenMode(false);
+    setLeftSidebarVisible((prev) => !prev);
+  }, []);
+
+  const toggleRightSidebar = useCallback(() => {
+    setZenMode(false);
+    setRightSidebarVisible((prev) => !prev);
+  }, []);
+
+  const toggleZenMode = useCallback(() => {
+    setZenMode((prev) => !prev);
+  }, []);
+
+  const startLeftResize = useCallback(
+    (event: React.MouseEvent) => {
+      leftResizeState.current = {
+        startX: event.clientX,
+        startWidth: leftSidebarWidth,
+      };
+      document.body.style.userSelect = 'none';
+    },
+    [leftSidebarWidth],
+  );
+
+  const startRightResize = useCallback(
+    (event: React.MouseEvent) => {
+      rightResizeState.current = {
+        startX: event.clientX,
+        startWidth: rightSidebarWidth,
+      };
+      document.body.style.userSelect = 'none';
+    },
+    [rightSidebarWidth],
+  );
+
+  const createChatSession = useCallback(
+    (workspaceId: string) => {
+      const sessionId = crypto.randomUUID();
+      const nextIndex = (sessionsByWorkspace[workspaceId]?.length ?? 0) + 1;
+      const session: ChatSession = {
+        id: sessionId,
+        workspaceId,
+        title: `Chat ${nextIndex}`,
+        model: 'Claude',
+      };
+      setSessionsByWorkspace((prev) => {
+        const list = prev[workspaceId] ?? [];
+        return { ...prev, [workspaceId]: [...list, session] };
+      });
+      setActiveSessionByWorkspace((prev) => ({ ...prev, [workspaceId]: sessionId }));
+      setActiveTabByWorkspace((prev) => ({ ...prev, [workspaceId]: 'session' }));
+    },
+    [sessionsByWorkspace],
+  );
+
+  const handleNewChat = useCallback(() => {
+    if (!activeWorkspaceId) {
+      return;
     }
-  };
+    setActiveView('workspace');
+    createChatSession(activeWorkspaceId);
+  }, [activeWorkspaceId, createChatSession, setActiveView]);
+
+  const handleSelectSession = useCallback((workspaceId: string, sessionId: string) => {
+    setSelectedWorkspaceId(workspaceId);
+    setActiveView('workspace');
+    setActiveSessionByWorkspace((prev) => ({ ...prev, [workspaceId]: sessionId }));
+    setActiveTabByWorkspace((prev) => ({ ...prev, [workspaceId]: 'session' }));
+  }, []);
+
+  const handleCloseSession = useCallback(
+    (workspaceId: string, sessionId: string) => {
+      const isClosingActive = activeSessionByWorkspace[workspaceId] === sessionId;
+      const remaining = (sessionsByWorkspace[workspaceId] ?? []).filter(
+        (session) => session.id !== sessionId,
+      );
+      setSessionsByWorkspace((prev) => ({ ...prev, [workspaceId]: remaining }));
+      if (isClosingActive) {
+        const nextActive = remaining.length > 0 ? remaining[remaining.length - 1].id : null;
+        setActiveSessionByWorkspace((prev) => ({ ...prev, [workspaceId]: nextActive }));
+        setActiveTabByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: nextActive ? 'session' : 'changes',
+        }));
+      }
+    },
+    [activeSessionByWorkspace, sessionsByWorkspace],
+  );
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isTypingTarget =
+        target?.tagName === 'INPUT' ||
+        target?.tagName === 'TEXTAREA' ||
+        target?.isContentEditable;
+      const key = event.key.toLowerCase();
+      const primary = isMac ? event.metaKey : event.ctrlKey;
+
+      if (primary && key === 'k') {
+        event.preventDefault();
+        setCommandPaletteOpen(true);
+        return;
+      }
+      if (primary && key === 'p') {
+        event.preventDefault();
+        setFileOpenerOpen(true);
+        return;
+      }
+      if (primary && key === 't') {
+        event.preventDefault();
+        handleNewChat();
+        return;
+      }
+      if (primary && key === 'b') {
+        event.preventDefault();
+        if (event.altKey) {
+          toggleRightSidebar();
+        } else {
+          toggleLeftSidebar();
+        }
+        return;
+      }
+      if (primary && key === '.') {
+        event.preventDefault();
+        toggleZenMode();
+        return;
+      }
+      if (!primary && !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+        if (isTypingTarget) {
+          return;
+        }
+        if (event.key === '[') {
+          event.preventDefault();
+          toggleLeftSidebar();
+        } else if (event.key === ']') {
+          event.preventDefault();
+          toggleRightSidebar();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleNewChat, isMac, toggleLeftSidebar, toggleRightSidebar, toggleZenMode]);
+
+  const loadWorkspaceFiles = useCallback(
+    async (workspaceId: string) => {
+      setFileListError(null);
+      try {
+        const files = await invoke<string[]>('listWorkspaceFiles', { workspaceId });
+        setFilesByWorkspace((prev) => ({ ...prev, [workspaceId]: files }));
+      } catch (err) {
+        setFileListError(String(err));
+        setFilesByWorkspace((prev) => ({ ...prev, [workspaceId]: [] }));
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (activeWorkspaceId && !filesByWorkspace[activeWorkspaceId]) {
+      loadWorkspaceFiles(activeWorkspaceId);
+    }
+    if (activeWorkspaceId) {
+      setActiveTabByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: prev[activeWorkspaceId] ?? 'changes',
+      }));
+    }
+  }, [activeWorkspaceId, filesByWorkspace, loadWorkspaceFiles]);
+
+  useEffect(() => {
+    setFileListVisibleCount(20);
+  }, [activeWorkspaceId]);
+
+  const handleOpenFile = useCallback(
+    async (workspaceId: string, path: string) => {
+      setFilePreviewError(null);
+      try {
+        const preview = await invoke<FilePreview>('readWorkspaceFile', {
+          workspaceId,
+          path,
+        });
+        setFilePreviewByWorkspace((prev) => ({ ...prev, [workspaceId]: preview }));
+        setRecentFilesByWorkspace((prev) => {
+          const existing = prev[workspaceId] ?? [];
+          const next = [path, ...existing.filter((item) => item !== path)].slice(0, 8);
+          return { ...prev, [workspaceId]: next };
+        });
+        setActiveTabByWorkspace((prev) => ({ ...prev, [workspaceId]: 'changes' }));
+      } catch (err) {
+        setFilePreviewError(String(err));
+      }
+    },
+    [],
+  );
 
   const requestArchiveWorkspace = (workspace: WorkspaceInfo) => {
     const repo = repos.find((item) => item.id === workspace.repoId);
@@ -387,6 +799,104 @@ export default function AppShell() {
         return 'Home';
     }
   }, [activeView, selectedRepo, selectedWorkspace]);
+  const workspaceLabel = useMemo(() => {
+    if (!selectedWorkspace || !selectedWorkspaceRepo) {
+      return undefined;
+    }
+    return `${selectedWorkspaceRepo.name} · ${selectedWorkspace.branch}`;
+  }, [selectedWorkspace, selectedWorkspaceRepo]);
+  const commandPaletteItems = useMemo<CommandPaletteItem[]>(() => {
+    const items: CommandPaletteItem[] = [
+      {
+        id: 'nav-home',
+        label: 'Home',
+        group: 'Navigation',
+        onSelect: () => setActiveView('home'),
+      },
+      {
+        id: 'nav-workspaces',
+        label: 'Workspaces',
+        group: 'Navigation',
+        onSelect: () => setActiveView('workspaces'),
+      },
+      {
+        id: 'nav-settings',
+        label: 'Settings',
+        group: 'Navigation',
+        onSelect: () => setActiveView('settings'),
+      },
+    ];
+
+    repos.forEach((repo) => {
+      items.push({
+        id: `repo-${repo.id}`,
+        label: repo.name,
+        description: repo.rootPath,
+        group: 'Repositories',
+        keywords: [repo.remoteUrl ?? ''],
+        onSelect: () => {
+          setSelectedRepoId(repo.id);
+          setActiveView('repo');
+        },
+      });
+    });
+
+    workspaces.forEach((workspace) => {
+      const repoName = repos.find((repo) => repo.id === workspace.repoId)?.name ?? 'Repository';
+      items.push({
+        id: `workspace-${workspace.id}`,
+        label: workspace.branch,
+        description: `${repoName} · ${workspace.state === 'archived' ? 'Archived' : 'Active'}`,
+        group: 'Workspaces',
+        onSelect: () => {
+          void handleSelectWorkspace(workspace);
+        },
+      });
+    });
+
+    Object.values(sessionsByWorkspace).flat().forEach((session) => {
+      const workspace = workspaces.find((item) => item.id === session.workspaceId);
+      const repoName = workspace
+        ? repos.find((repo) => repo.id === workspace.repoId)?.name ?? 'Repository'
+        : 'Workspace';
+      const label = workspace ? `${session.title}` : session.title;
+      const description = workspace
+        ? `${repoName} · ${workspace.branch} · ${session.model}`
+        : session.model;
+      items.push({
+        id: `session-${session.id}`,
+        label,
+        description,
+        group: 'Sessions',
+        onSelect: () => handleSelectSession(session.workspaceId, session.id),
+      });
+    });
+
+    const settingsSections = [
+      'General',
+      'Account',
+      'Git',
+      'Env',
+      'Terminal',
+      'MCP',
+      'Commands',
+      'Agents',
+      'Memory',
+      'Hooks',
+      'Experimental',
+    ];
+    settingsSections.forEach((section) => {
+      items.push({
+        id: `settings-${section}`,
+        label: section,
+        group: 'Settings',
+        description: 'Settings section',
+        onSelect: () => setActiveView('settings'),
+      });
+    });
+
+    return items;
+  }, [handleSelectSession, handleSelectWorkspace, repos, sessionsByWorkspace, workspaces]);
 
   useEffect(() => {
     if (!addRepoOpen) {
@@ -565,276 +1075,681 @@ export default function AppShell() {
   }, [workspaceMenuId]);
 
   return (
-    <>
-      <div className="grid h-screen grid-cols-[260px_1fr_320px] bg-slate-950 text-slate-100">
-        <aside className="flex flex-col gap-4 border-r border-slate-800 p-4">
-          <div className="text-xl font-semibold">Supertree</div>
-          <div className="text-xs uppercase tracking-[0.2em] text-slate-500">Navigation</div>
-          <div className="flex flex-col gap-2">
-            <Button variant="outline" onClick={() => setActiveView('home')}>
-              Home
-            </Button>
-            <Button variant="outline" onClick={() => setActiveView('workspaces')}>
-              Workspaces
-            </Button>
-          </div>
+    <TooltipProvider>
+      <>
+      <div className="flex h-screen w-full bg-slate-950 text-slate-100">
+      {showLeftSidebar ? (
+        <>
+          <aside
+            className="flex h-full flex-shrink-0 flex-col border-r border-slate-800 bg-slate-950"
+            style={{ width: leftSidebarWidth }}
+          >
+            <div className="border-b border-slate-800 px-4 py-4">
+              <div className="text-lg font-semibold">Supertree</div>
+              <div className="mt-3 flex flex-col gap-2">
+                <button
+                  type="button"
+                  onClick={() => setActiveView('home')}
+                  className={`rounded-md px-3 py-2 text-left text-sm transition ${
+                    activeView === 'home'
+                      ? 'bg-slate-800 text-slate-100'
+                      : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                  }`}
+                >
+                  Home
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveView('workspaces')}
+                  className={`rounded-md px-3 py-2 text-left text-sm transition ${
+                    activeView === 'workspaces'
+                      ? 'bg-slate-800 text-slate-100'
+                      : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                  }`}
+                >
+                  Workspaces
+                </button>
+              </div>
+            </div>
 
-          <div className="mt-2">
-            <div className="text-xs uppercase tracking-[0.2em] text-slate-500">Repositories</div>
-            <div className="mt-3 flex flex-col gap-3">
-              {repos.length === 0 ? (
-                <div className="rounded-md border border-slate-800/60 px-3 py-2 text-sm text-slate-500">
-                  No repositories yet.
-                </div>
-              ) : (
-                repos.map((repo) => {
-                  const expanded = expandedRepoIds.has(repo.id);
-                  const isSelected = repo.id === selectedRepoId;
-                  const repoWorkspaces = workspacesByRepo.get(repo.id) ?? [];
-                  return (
-                    <div key={repo.id} className="rounded-md border border-slate-800/60">
-                      <div className="flex items-center justify-between gap-2 px-3 py-2">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setSelectedRepoId(repo.id);
-                            setActiveView('repo');
-                          }}
-                          className={`text-left text-sm font-medium ${
-                            isSelected ? 'text-slate-100' : 'text-slate-300 hover:text-slate-100'
-                          }`}
-                        >
-                          {repo.name}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => toggleRepo(repo.id)}
-                          className="text-xs text-slate-500 hover:text-slate-200"
-                        >
-                          {expanded ? '-' : '+'}
-                        </button>
-                      </div>
-                      {expanded ? (
-                        <div className="border-t border-slate-800/60 px-3 py-3">
-                          <div className="flex items-center gap-2">
-                            <Button size="sm" variant="outline" onClick={() => openCreateWorkspace(repo)}>
-                              New workspace
-                            </Button>
-                          </div>
-                          {repoWorkspaces.length === 0 ? (
-                            <div className="mt-2 text-xs text-slate-500">No workspaces yet.</div>
-                          ) : (
-                            <div className="mt-3 flex flex-col gap-2">
-                              {repoWorkspaces.map((workspace) => {
-                                const isWorkspaceSelected =
-                                  workspace.id === selectedWorkspaceId;
-                                const isMenuOpen = workspaceMenuId === workspace.id;
-                                return (
-                                  <div
-                                    key={workspace.id}
-                                    className="flex items-center justify-between gap-2"
-                                  >
-                                    <button
-                                      type="button"
-                                      onClick={() => handleSelectWorkspace(workspace)}
-                                      className={`flex flex-1 items-center gap-2 text-left text-xs ${
-                                        isWorkspaceSelected
-                                          ? 'text-slate-100'
-                                          : 'text-slate-300 hover:text-slate-100'
-                                      }`}
-                                    >
-                                      <span className="truncate">{workspace.branch}</span>
-                                      {workspace.pinnedAt ? (
-                                        <span className="text-[10px] uppercase tracking-widest text-slate-500">
-                                          Pinned
-                                        </span>
-                                      ) : null}
-                                      {workspace.unread ? (
-                                        <span className="h-2 w-2 rounded-full bg-amber-400" />
-                                      ) : null}
-                                    </button>
+            <div className="flex-1 overflow-auto px-4 py-4">
+              <div className="text-xs uppercase tracking-[0.2em] text-slate-500">
+                Repositories
+              </div>
+              <div className="mt-3 flex flex-col gap-3">
+                {repos.length === 0 ? (
+                  <div className="rounded-md border border-slate-800/60 px-3 py-2 text-sm text-slate-500">
+                    No repositories yet.
+                  </div>
+                ) : (
+                  repos.map((repo) => {
+                    const expanded = expandedRepoIds.has(repo.id);
+                    const isSelected = repo.id === selectedRepoId;
+                    const repoWorkspaces = workspacesByRepo.get(repo.id) ?? [];
+                    return (
+                      <div
+                        key={repo.id}
+                        className="rounded-md border border-slate-800/60 bg-slate-950/60"
+                      >
+                        <div className="flex items-center justify-between gap-2 px-3 py-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedRepoId(repo.id);
+                              setActiveView('repo');
+                            }}
+                            className={`text-left text-sm font-medium transition ${
+                              isSelected
+                                ? 'text-slate-100'
+                                : 'text-slate-300 hover:text-slate-100'
+                            }`}
+                          >
+                            {repo.name}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => toggleRepo(repo.id)}
+                            className="text-xs text-slate-500 hover:text-slate-200"
+                          >
+                            {expanded ? '-' : '+'}
+                          </button>
+                        </div>
+                        {expanded ? (
+                          <div className="border-t border-slate-800/60 px-3 py-3">
+                            <div className="flex items-center gap-2">
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => openCreateWorkspace(repo)}
+                              >
+                                New workspace
+                              </Button>
+                            </div>
+                            {repoWorkspaces.length === 0 ? (
+                              <div className="mt-2 text-xs text-slate-500">
+                                No workspaces yet.
+                              </div>
+                            ) : (
+                              <div className="mt-3 flex flex-col gap-2">
+                                {repoWorkspaces.map((workspace) => {
+                                  const isWorkspaceSelected =
+                                    workspace.id === selectedWorkspaceId;
+                                  const isMenuOpen = workspaceMenuId === workspace.id;
+                                  return (
                                     <div
-                                      className="relative"
-                                      ref={(node) => {
-                                        workspaceMenuRefs.current[workspace.id] = node;
-                                      }}
+                                      key={workspace.id}
+                                      className="flex items-center justify-between gap-2"
                                     >
                                       <button
                                         type="button"
-                                        onClick={() =>
-                                          setWorkspaceMenuId((prev) =>
-                                            prev === workspace.id ? null : workspace.id,
-                                          )
-                                        }
-                                        className="text-xs text-slate-500 hover:text-slate-200"
+                                        onClick={() => handleSelectWorkspace(workspace)}
+                                        className={`flex flex-1 items-center gap-2 text-left text-xs transition ${
+                                          isWorkspaceSelected
+                                            ? 'text-slate-100'
+                                            : 'text-slate-300 hover:text-slate-100'
+                                        }`}
                                       >
-                                        ...
+                                        <span className="truncate">{workspace.branch}</span>
+                                        {workspace.pinnedAt ? (
+                                          <span className="text-[10px] uppercase tracking-widest text-slate-500">
+                                            Pinned
+                                          </span>
+                                        ) : null}
+                                        {workspace.unread ? (
+                                          <span className="h-2 w-2 rounded-full bg-amber-400" />
+                                        ) : null}
                                       </button>
-                                      {isMenuOpen ? (
-                                        <div className="absolute right-0 mt-2 w-40 rounded-md border border-slate-800 bg-slate-950 p-2 text-xs shadow-xl">
-                                          <button
-                                            type="button"
-                                            onClick={() => {
-                                              setWorkspaceMenuId(null);
-                                              void handlePinWorkspace(
-                                                workspace.id,
-                                                !workspace.pinnedAt,
-                                              );
-                                            }}
-                                            className="w-full rounded-md px-3 py-2 text-left text-slate-200 hover:bg-slate-900"
-                                          >
-                                            {workspace.pinnedAt ? 'Unpin' : 'Pin'}
-                                          </button>
-                                          <button
-                                            type="button"
-                                            onClick={() => {
-                                              setWorkspaceMenuId(null);
-                                              requestArchiveWorkspace(workspace);
-                                            }}
-                                            className="w-full rounded-md px-3 py-2 text-left text-slate-200 hover:bg-slate-900"
-                                          >
-                                            Archive
-                                          </button>
-                                          <button
-                                            type="button"
-                                            disabled={workspace.unread}
-                                            onClick={() => {
-                                              setWorkspaceMenuId(null);
-                                              void handleUnreadWorkspace(workspace.id, true);
-                                            }}
-                                            className="w-full rounded-md px-3 py-2 text-left text-slate-200 hover:bg-slate-900 disabled:cursor-not-allowed disabled:text-slate-500"
-                                          >
-                                            Mark as Unread
-                                          </button>
-                                        </div>
-                                      ) : null}
+                                      <div
+                                        className="relative"
+                                        ref={(node) => {
+                                          workspaceMenuRefs.current[workspace.id] = node;
+                                        }}
+                                      >
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            setWorkspaceMenuId((prev) =>
+                                              prev === workspace.id ? null : workspace.id,
+                                            )
+                                          }
+                                          className="text-xs text-slate-500 hover:text-slate-200"
+                                        >
+                                          ...
+                                        </button>
+                                        {isMenuOpen ? (
+                                          <div className="absolute right-0 mt-2 w-40 rounded-md border border-slate-800 bg-slate-950 p-2 text-xs shadow-xl">
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                setWorkspaceMenuId(null);
+                                                void handlePinWorkspace(
+                                                  workspace.id,
+                                                  !workspace.pinnedAt,
+                                                );
+                                              }}
+                                              className="w-full rounded-md px-3 py-2 text-left text-slate-200 hover:bg-slate-900"
+                                            >
+                                              {workspace.pinnedAt ? 'Unpin' : 'Pin'}
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                setWorkspaceMenuId(null);
+                                                requestArchiveWorkspace(workspace);
+                                              }}
+                                              className="w-full rounded-md px-3 py-2 text-left text-slate-200 hover:bg-slate-900"
+                                            >
+                                              Archive
+                                            </button>
+                                            <button
+                                              type="button"
+                                              disabled={workspace.unread}
+                                              onClick={() => {
+                                                setWorkspaceMenuId(null);
+                                                void handleUnreadWorkspace(workspace.id, true);
+                                              }}
+                                              className="w-full rounded-md px-3 py-2 text-left text-slate-200 hover:bg-slate-900 disabled:cursor-not-allowed disabled:text-slate-500"
+                                            >
+                                              Mark as Unread
+                                            </button>
+                                          </div>
+                                        ) : null}
+                                      </div>
                                     </div>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </div>
-                      ) : null}
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          </div>
-
-          <div className="mt-auto flex flex-col gap-2">
-            <Button variant="outline" onClick={() => setAddRepoOpen(true)}>
-              Add repository
-            </Button>
-            <Button variant="outline" onClick={() => setActiveView('settings')}>
-              Settings
-            </Button>
-            <div className="text-xs text-slate-500">M03 workspaces</div>
-          </div>
-        </aside>
-
-        <main className="flex h-full flex-col">
-          <div className="flex items-center gap-4 border-b border-slate-800 px-6 py-3">
-            <div className="text-sm font-medium">
-              {headerTitle}
-            </div>
-            {activeView === 'home' ? <div className="text-sm text-slate-500">Chat 1</div> : null}
-          </div>
-          <div className="flex-1 overflow-auto px-6 py-6">
-            {workspaceError ? (
-              <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
-                {workspaceError}
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })
+                )}
               </div>
-            ) : null}
-            {repoError ? (
-              <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
-                {repoError}
+            </div>
+
+            <div className="border-t border-slate-800 px-4 py-4">
+              <div className="flex flex-col gap-2">
+                <Button variant="outline" onClick={() => setAddRepoOpen(true)}>
+                  Add repository
+                </Button>
+                <Button variant="outline" onClick={() => setActiveView('settings')}>
+                  Settings
+                </Button>
               </div>
-            ) : null}
-            {activeView === 'settings' ? (
-              <SettingsPage />
-            ) : activeView === 'repo' ? (
-              selectedRepo ? (
-                <RepositoryPage
-                  repo={selectedRepo}
-                  onOpen={handleOpenRepo}
-                  onRemove={() => handleRemoveRepo(selectedRepo.id)}
-                />
-              ) : (
-                <div className="rounded-md border border-slate-800 bg-slate-900/40 p-4 text-sm text-slate-400">
-                  Select a repository from the sidebar to view its details.
+              <div className="mt-3 text-xs text-slate-500">M04 shell</div>
+            </div>
+          </aside>
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            onMouseDown={startLeftResize}
+            className="group relative h-full w-1 flex-shrink-0 cursor-col-resize bg-transparent"
+          >
+            <div className="absolute inset-y-0 left-0 w-px bg-slate-800 transition group-hover:bg-slate-500" />
+          </div>
+        </>
+      ) : null}
+
+      <main className="flex min-w-0 flex-1 flex-col">
+        <div className="border-b border-slate-800 bg-slate-950">
+          <div className="flex items-center justify-between gap-4 px-4 py-2">
+            <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
+              <button
+                type="button"
+                disabled={!activeWorkspaceId}
+                onClick={() => {
+                  if (!activeWorkspaceId) {
+                    return;
+                  }
+                  setActiveView('workspace');
+                  setActiveTabByWorkspace((prev) => ({
+                    ...prev,
+                    [activeWorkspaceId]: 'changes',
+                  }));
+                }}
+                className={`rounded-md px-3 py-1.5 text-sm transition ${
+                  !activeWorkspaceId
+                    ? 'cursor-not-allowed text-slate-600'
+                    : activeTab === 'changes'
+                      ? 'bg-slate-800 text-slate-100'
+                      : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                }`}
+              >
+                All changes
+              </button>
+              {activeSessions.map((session) => {
+                const isActive =
+                  activeTab === 'session' && activeSessionId === session.id;
+                return (
+                  <button
+                    key={session.id}
+                    type="button"
+                    onClick={() => handleSelectSession(session.workspaceId, session.id)}
+                    onMouseDown={(event) => {
+                      if (event.button === 1) {
+                        event.preventDefault();
+                        handleCloseSession(session.workspaceId, session.id);
+                      }
+                    }}
+                    className={`flex items-center gap-2 rounded-md px-3 py-1.5 text-sm transition ${
+                      isActive
+                        ? 'bg-slate-800 text-slate-100'
+                        : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                    }`}
+                  >
+                    <span className="truncate">{session.title}</span>
+                    <span className="text-[10px] uppercase tracking-widest text-slate-500">
+                      {session.model}
+                    </span>
+                  </button>
+                );
+              })}
+              <button
+                type="button"
+                disabled={!activeWorkspaceId}
+                onClick={handleNewChat}
+                className={`rounded-md px-3 py-1.5 text-sm transition ${
+                  !activeWorkspaceId
+                    ? 'cursor-not-allowed text-slate-600'
+                    : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                }`}
+              >
+                + New chat
+              </button>
+              {activeView !== 'workspace' ? (
+                <div className="ml-3 text-xs uppercase tracking-[0.2em] text-slate-600">
+                  {headerTitle}
                 </div>
-              )
-            ) : activeView === 'workspaces' ? (
-              <WorkspacesPage
-                workspaces={workspaces}
-                repos={repos}
-                onOpen={handleSelectWorkspace}
-                onUnarchive={handleUnarchiveWorkspace}
+              ) : null}
+            </div>
+            <div className="flex items-center gap-2">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    className="rounded-md border border-slate-800 px-3 py-1.5 text-xs text-slate-400 transition hover:bg-slate-900 hover:text-slate-100"
+                  >
+                    History
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>View chat history</TooltipContent>
+              </Tooltip>
+              <button
+                type="button"
+                onClick={() => setCommandPaletteOpen(true)}
+                className="rounded-md border border-slate-800 px-3 py-1.5 text-xs text-slate-400 transition hover:bg-slate-900 hover:text-slate-100"
+              >
+                {isMac ? 'Cmd+K' : 'Ctrl+K'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setFileOpenerOpen(true)}
+                className="rounded-md border border-slate-800 px-3 py-1.5 text-xs text-slate-400 transition hover:bg-slate-900 hover:text-slate-100"
+              >
+                {isMac ? 'Cmd+P' : 'Ctrl+P'}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-auto px-6 py-6">
+          {workspaceError ? (
+            <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+              {workspaceError}
+            </div>
+          ) : null}
+          {repoError ? (
+            <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+              {repoError}
+            </div>
+          ) : null}
+          {fileListError ? (
+            <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+              {fileListError}
+            </div>
+          ) : null}
+          {filePreviewError ? (
+            <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+              {filePreviewError}
+            </div>
+          ) : null}
+
+          {activeView === 'settings' ? (
+            <SettingsPage />
+          ) : activeView === 'repo' ? (
+            selectedRepo ? (
+              <RepositoryPage
+                repo={selectedRepo}
+                onOpen={handleOpenRepo}
+                onRemove={() => handleRemoveRepo(selectedRepo.id)}
               />
-            ) : activeView === 'workspace' ? (
-              selectedWorkspace ? (
-                <WorkspacePage
-                  workspace={selectedWorkspace}
-                  repo={selectedWorkspaceRepo}
-                  onArchive={() => requestArchiveWorkspace(selectedWorkspace)}
-                  onUnarchive={() => handleUnarchiveWorkspace(selectedWorkspace.id)}
-                />
-              ) : (
-                <div className="rounded-md border border-slate-800 bg-slate-900/40 p-4 text-sm text-slate-400">
-                  Select a workspace from the sidebar to view its details.
-                </div>
-              )
             ) : (
-              <>
-                <h1 className="text-2xl font-semibold">Workspace overview</h1>
+              <div className="rounded-md border border-slate-800 bg-slate-900/40 p-4 text-sm text-slate-400">
+                Select a repository from the sidebar to view its details.
+              </div>
+            )
+          ) : activeView === 'workspaces' ? (
+            <WorkspacesPage
+              workspaces={workspaces}
+              repos={repos}
+              onOpen={handleSelectWorkspace}
+              onUnarchive={handleUnarchiveWorkspace}
+            />
+          ) : activeView === 'workspace' ? (
+            selectedWorkspace ? (
+              <div className="space-y-6">
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div>
+                    <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                      Workspace
+                    </div>
+                    <div className="mt-2 text-lg font-semibold">
+                      {workspaceLabel ?? 'Workspace'}
+                    </div>
+                    {selectedWorkspace.path ? (
+                      <div className="mt-1 text-xs text-slate-500">
+                        {selectedWorkspace.path}
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="text-xs text-slate-500">
+                    {workspaceFiles.length} files
+                  </div>
+                </div>
+
+                {activeTab === 'changes' ? (
+                  <div className="grid gap-6 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+                    <div className="rounded-lg border border-slate-800 bg-slate-950/60">
+                      <div className="border-b border-slate-800 px-4 py-3">
+                        <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                          Diff preview
+                        </div>
+                        <div className="mt-1 text-xs text-slate-500">
+                          Unified diff placeholder
+                        </div>
+                      </div>
+                      <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap px-4 py-3 text-xs text-slate-200">
+                        {DIFF_PLACEHOLDER}
+                      </pre>
+                    </div>
+                    <div className="rounded-lg border border-slate-800 bg-slate-950/60">
+                      <div className="border-b border-slate-800 px-4 py-3">
+                        <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                          File preview
+                        </div>
+                        {filePreview ? (
+                          <div className="mt-1 text-xs text-slate-500">
+                            {filePreview.path}
+                            {filePreview.binary
+                              ? ' (binary)'
+                              : filePreview.truncated
+                                ? ' (truncated)'
+                                : ''}
+                          </div>
+                        ) : (
+                          <div className="mt-1 text-xs text-slate-500">
+                            Open a file to preview.
+                          </div>
+                        )}
+                      </div>
+                      <div className="max-h-[360px] overflow-auto px-4 py-3 text-xs text-slate-200">
+                        {filePreview ? (
+                          filePreview.binary ? (
+                            <div className="text-sm text-slate-500">
+                              Binary file preview is not available.
+                            </div>
+                          ) : (
+                            <>
+                              <pre className="whitespace-pre-wrap">
+                                {filePreview.content}
+                              </pre>
+                              {filePreview.truncated ? (
+                                <div className="mt-3 text-xs text-amber-400">
+                                  Preview truncated. Open the file in an editor for the full content.
+                                </div>
+                              ) : null}
+                            </>
+                          )
+                        ) : (
+                          <div className="text-sm text-slate-500">
+                            Use {isMac ? 'Cmd+P' : 'Ctrl+P'} to open a file.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-6">
+                    <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                      Chat
+                    </div>
+                    <div className="mt-2 text-sm text-slate-400">
+                      Chat sessions render here in a future milestone.
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="rounded-md border border-slate-800 bg-slate-900/40 p-4 text-sm text-slate-400">
+                Select a workspace from the sidebar to view its details.
+              </div>
+            )
+          ) : (
+            <div className="space-y-6">
+              <div>
+                <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                  Home
+                </div>
+                <h1 className="mt-2 text-2xl font-semibold">Workspace overview</h1>
                 <p className="mt-2 text-sm text-slate-400">
                   This is the Tauri + React shell for Supertree. The panels match the final
                   layout and the backend command is wired through.
                 </p>
-                <div className="mt-6 rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-                  <div className="text-xs uppercase tracking-widest text-slate-500">Backend</div>
-                  <div className="mt-2 text-sm">
-                    {error ? `Error: ${error}` : `Rust says: ${greeting}`}
+              </div>
+              <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
+                <div className="text-xs uppercase tracking-widest text-slate-500">
+                  Backend
+                </div>
+                <div className="mt-2 text-sm">
+                  {error ? `Error: ${error}` : `Rust says: ${greeting}`}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="border-t border-slate-800 px-6 py-4">
+          <div className="flex items-center justify-between text-xs uppercase tracking-widest text-slate-500">
+            <span>Composer</span>
+            <span>{activeWorkspaceId ? 'Ready' : 'Select a workspace to start'}</span>
+          </div>
+          <div
+            className={`mt-3 h-12 rounded-md border ${
+              activeWorkspaceId
+                ? 'border-slate-800 bg-slate-900/40'
+                : 'border-slate-900 bg-slate-950/40'
+            }`}
+          />
+        </div>
+      </main>
+
+      {showRightSidebar ? (
+        <>
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            onMouseDown={startRightResize}
+            className="group relative h-full w-1 flex-shrink-0 cursor-col-resize bg-transparent"
+          >
+            <div className="absolute inset-y-0 right-0 w-px bg-slate-800 transition group-hover:bg-slate-500" />
+          </div>
+          <aside
+            className="flex h-full flex-shrink-0 flex-col border-l border-slate-800 bg-slate-950"
+            style={{ width: rightSidebarWidth }}
+          >
+            <div className="border-b border-slate-800 p-4">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-semibold">Version control</div>
+                <div className="text-xs text-slate-500">
+                  {activeWorkspaceId ? 'Workspace' : 'No workspace'}
+                </div>
+              </div>
+              <div className="mt-3 flex gap-2">
+                <Button size="sm">Create PR</Button>
+                <Button size="sm" variant="outline">
+                  Review
+                </Button>
+              </div>
+              <div className="mt-4 flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setGitPanelTab('changes')}
+                  className={`rounded-md px-3 py-1.5 text-xs transition ${
+                    gitPanelTab === 'changes'
+                      ? 'bg-slate-800 text-slate-100'
+                      : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                  }`}
+                >
+                  Changes
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setGitPanelTab('files')}
+                  className={`rounded-md px-3 py-1.5 text-xs transition ${
+                    gitPanelTab === 'files'
+                      ? 'bg-slate-800 text-slate-100'
+                      : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                  }`}
+                >
+                  All files
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-auto p-4">
+              {gitPanelTab === 'changes' ? (
+                <div className="text-sm text-slate-500">No changes yet.</div>
+              ) : !activeWorkspaceId ? (
+                <div className="text-sm text-slate-500">
+                  Select a workspace to browse files.
+                </div>
+              ) : workspaceFiles.length === 0 ? (
+                <div className="text-sm text-slate-500">No files loaded.</div>
+              ) : (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-[11px] text-slate-500">
+                    <span>
+                      Showing {visibleFileCount} of {workspaceFiles.length} files
+                    </span>
+                    {fileListIsTruncated ? (
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          aria-label="Show more files"
+                          onClick={() =>
+                            setFileListVisibleCount((prev) =>
+                              Math.min(prev + 20, workspaceFiles.length),
+                            )
+                          }
+                          className="rounded-md border border-slate-800 px-2 py-1 text-[11px] text-slate-400 transition hover:bg-slate-900 hover:text-slate-100"
+                        >
+                          Show more
+                        </button>
+                        <button
+                          type="button"
+                          aria-label="Show all files"
+                          onClick={() =>
+                            setFileListVisibleCount(workspaceFiles.length)
+                          }
+                          className="rounded-md border border-slate-800 px-2 py-1 text-[11px] text-slate-400 transition hover:bg-slate-900 hover:text-slate-100"
+                        >
+                          Show all
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="space-y-2">
+                    {workspaceFiles.slice(0, visibleFileCount).map((file) => (
+                      <button
+                        key={file}
+                        type="button"
+                        onClick={() => {
+                          if (!activeWorkspaceId) {
+                            return;
+                          }
+                          void handleOpenFile(activeWorkspaceId, file);
+                          setActiveView('workspace');
+                        }}
+                        className="w-full rounded-md px-2 py-1 text-left text-xs text-slate-300 hover:bg-slate-900 hover:text-slate-100"
+                      >
+                        {file}
+                      </button>
+                    ))}
                   </div>
                 </div>
-              </>
-            )}
-          </div>
-          {activeView === 'home' ? (
-            <div className="border-t border-slate-800 px-6 py-4">
-              <div className="text-xs uppercase tracking-widest text-slate-500">Composer</div>
-              <div className="mt-2 h-12 rounded-md border border-slate-800 bg-slate-900/40" />
+              )}
             </div>
-          ) : null}
-        </main>
 
-        <aside className="flex h-full flex-col border-l border-slate-800">
-          <div className="border-b border-slate-800 p-4">
-            <div className="text-sm font-semibold">Version control</div>
-            <div className="mt-3 flex gap-2">
-              <Button size="sm">Create PR</Button>
-              <Button size="sm" variant="outline">
-                Review
-              </Button>
+            <div className="border-t border-slate-800 p-4">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-semibold">Run / Terminal</div>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setRightPanelTab('run')}
+                    className={`rounded-md px-3 py-1.5 text-xs transition ${
+                      rightPanelTab === 'run'
+                        ? 'bg-slate-800 text-slate-100'
+                        : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                    }`}
+                  >
+                    Run
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRightPanelTab('terminal')}
+                    className={`rounded-md px-3 py-1.5 text-xs transition ${
+                      rightPanelTab === 'terminal'
+                        ? 'bg-slate-800 text-slate-100'
+                        : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                    }`}
+                  >
+                    Terminal
+                  </button>
+                </div>
+              </div>
+              <div className="mt-3 rounded-md border border-slate-800 bg-slate-900/40 p-3 text-xs text-slate-500">
+                {rightPanelTab === 'run'
+                  ? 'Run output placeholder.'
+                  : 'Terminal output placeholder.'}
+              </div>
             </div>
-          </div>
-          <div className="flex-1 border-b border-slate-800 p-4">
-            <div className="text-xs uppercase tracking-widest text-slate-500">Changes</div>
-            <div className="mt-2 text-sm text-slate-500">No changes yet.</div>
-          </div>
-          <div className="p-4">
-            <div className="text-sm font-semibold">Run / Terminal</div>
-            <div className="mt-3 flex gap-2">
-              <Button size="sm">Run</Button>
-              <Button size="sm" variant="outline">
-                Terminal
-              </Button>
-            </div>
-          </div>
-        </aside>
-      </div>
+          </aside>
+        </>
+      ) : null}
+    </div>
+
+    <CommandPalette
+      open={commandPaletteOpen}
+      items={commandPaletteItems}
+      onOpenChange={setCommandPaletteOpen}
+    />
+    <FileOpener
+      open={fileOpenerOpen}
+      files={workspaceFiles}
+      recentFiles={recentFiles}
+      workspaceLabel={workspaceLabel}
+      onOpenChange={setFileOpenerOpen}
+      onOpenFile={(path) => {
+        if (!activeWorkspaceId) {
+          return;
+        }
+        setActiveView('workspace');
+        void handleOpenFile(activeWorkspaceId, path);
+      }}
+    />
 
       {archiveConfirmOpen && archiveConfirmWorkspace ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-6">
@@ -1098,6 +2013,7 @@ export default function AppShell() {
           </div>
         </div>
       ) : null}
-    </>
+      </>
+    </TooltipProvider>
   );
 }

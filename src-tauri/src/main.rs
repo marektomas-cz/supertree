@@ -37,6 +37,15 @@ struct AppInfo {
   paths: AppPaths,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FilePreview {
+  path: String,
+  content: String,
+  truncated: bool,
+  binary: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum AddRepoRequest {
@@ -482,6 +491,39 @@ async fn setWorkspaceSparseCheckout(
 
 #[allow(non_snake_case)]
 #[tauri::command]
+async fn listWorkspaceFiles(
+  db: tauri::State<'_, Database>,
+  paths: tauri::State<'_, AppPaths>,
+  workspace_id: String,
+) -> Result<Vec<String>, String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let root = resolve_workspace_root(&paths, Path::new(&workspace_record.path))?;
+  tauri::async_runtime::spawn_blocking(move || list_workspace_files(&root))
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn readWorkspaceFile(
+  db: tauri::State<'_, Database>,
+  paths: tauri::State<'_, AppPaths>,
+  workspace_id: String,
+  path: String,
+) -> Result<FilePreview, String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let root = resolve_workspace_root(&paths, Path::new(&workspace_record.path))?;
+  tauri::async_runtime::spawn_blocking(move || read_workspace_file(&root, &path))
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
 fn openPathIn(path: String, target: OpenTarget) -> Result<(), String> {
   let path = PathBuf::from(path);
   if !path.exists() {
@@ -553,6 +595,135 @@ fn build_open_command(path: &PathBuf, target: &OpenTarget) -> Command {
 fn ensure_context_dirs(workspace_path: &Path) -> Result<(), String> {
   let context_dir = workspace_path.join(".context").join("attachments");
   fs::create_dir_all(&context_dir).map_err(|err| err.to_string())
+}
+
+const MAX_WORKSPACE_FILES: usize = 2000;
+const MAX_FILE_PREVIEW_BYTES: usize = 200_000;
+
+fn resolve_workspace_root(paths: &AppPaths, workspace_path: &Path) -> Result<PathBuf, String> {
+  let workspace_root = paths
+    .workspaces_dir
+    .canonicalize()
+    .map_err(|err| format!("Cannot resolve workspaces root: {err}"))?;
+  let resolved = workspace_path
+    .canonicalize()
+    .map_err(|err| format!("Cannot resolve workspace path: {err}"))?;
+  if !resolved.starts_with(&workspace_root) {
+    return Err(format!(
+      "Refusing to access workspace outside managed directory: {}",
+      resolved.display()
+    ));
+  }
+  Ok(resolved)
+}
+
+fn should_skip_dir(path: &Path) -> bool {
+  let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+    return true;
+  };
+  matches!(
+    name,
+    ".git"
+      | "node_modules"
+      | "target"
+      | "dist"
+      | "build"
+      | "out"
+      | ".turbo"
+      | ".next"
+      | ".cache"
+  )
+}
+
+fn is_likely_binary(buffer: &[u8]) -> bool {
+  buffer.iter().take(8_000).any(|&byte| byte == 0)
+}
+
+fn list_workspace_files(root: &Path) -> Result<Vec<String>, String> {
+  let mut results = Vec::new();
+  let mut stack = vec![root.to_path_buf()];
+  let mut limit_reached = false;
+  while let Some(dir) = stack.pop() {
+    let entries = fs::read_dir(&dir).map_err(|err| err.to_string())?;
+    for entry in entries {
+      let entry = entry.map_err(|err| err.to_string())?;
+      let path = entry.path();
+      let file_type = entry.file_type().map_err(|err| err.to_string())?;
+      if file_type.is_dir() {
+        if should_skip_dir(&path) {
+          continue;
+        }
+        stack.push(path);
+        continue;
+      }
+      if !file_type.is_file() {
+        continue;
+      }
+      let relative = path
+        .strip_prefix(root)
+        .map_err(|err| err.to_string())?
+        .to_string_lossy()
+        .replace('\\', "/");
+      results.push(relative);
+      if results.len() >= MAX_WORKSPACE_FILES {
+        limit_reached = true;
+        break;
+      }
+    }
+    if limit_reached {
+      break;
+    }
+  }
+  results.sort();
+  if results.len() > MAX_WORKSPACE_FILES {
+    results.truncate(MAX_WORKSPACE_FILES);
+  }
+  Ok(results)
+}
+
+fn read_workspace_file(root: &Path, relative_path: &str) -> Result<FilePreview, String> {
+  let candidate = PathBuf::from(relative_path);
+  if candidate.is_absolute() {
+    return Err("Path must be workspace-relative".to_string());
+  }
+  let file_path = root.join(candidate);
+  let resolved = file_path
+    .canonicalize()
+    .map_err(|err| format!("Cannot resolve file path: {err}"))?;
+  if !resolved.starts_with(root) {
+    return Err(format!(
+      "Refusing to read file outside workspace: {}",
+      resolved.display()
+    ));
+  }
+  if !resolved.is_file() {
+    return Err(format!("File not found: {}", resolved.display()));
+  }
+  let file = fs::File::open(&resolved).map_err(|err| err.to_string())?;
+  let mut buffer = Vec::new();
+  let mut handle = file.take((MAX_FILE_PREVIEW_BYTES + 1) as u64);
+  handle.read_to_end(&mut buffer).map_err(|err| err.to_string())?;
+  let truncated = buffer.len() > MAX_FILE_PREVIEW_BYTES;
+  if truncated {
+    buffer.truncate(MAX_FILE_PREVIEW_BYTES);
+  }
+  let binary = is_likely_binary(&buffer);
+  let content = if binary {
+    String::new()
+  } else {
+    String::from_utf8_lossy(&buffer).to_string()
+  };
+  let relative = resolved
+    .strip_prefix(root)
+    .map_err(|err| err.to_string())?
+    .to_string_lossy()
+    .replace('\\', "/");
+  Ok(FilePreview {
+    path: relative,
+    content,
+    truncated: truncated && !binary,
+    binary,
+  })
 }
 
 fn run_workspace_script(
@@ -715,6 +886,8 @@ fn main() {
       pinWorkspace,
       markWorkspaceUnread,
       setWorkspaceSparseCheckout,
+      listWorkspaceFiles,
+      readWorkspaceFile,
       openPathIn
     ])
     .run(tauri::generate_context!())
