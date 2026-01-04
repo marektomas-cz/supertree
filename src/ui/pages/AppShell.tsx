@@ -155,8 +155,23 @@ const truncateReviewDiff = (diff: string) => {
   if (diff.length <= REVIEW_DIFF_MAX_CHARS) {
     return { text: diff, truncated: false };
   }
-  const head = diff.slice(0, REVIEW_DIFF_HEAD_CHARS);
-  const tail = diff.slice(-REVIEW_DIFF_TAIL_CHARS);
+  const headSection = diff.slice(0, REVIEW_DIFF_HEAD_CHARS);
+  const headBoundary = Math.max(
+    headSection.lastIndexOf('\ndiff --git'),
+    headSection.lastIndexOf('\n@@'),
+  );
+  const head = headBoundary > 0 ? headSection.slice(0, headBoundary) : headSection;
+
+  const tailSection = diff.slice(-REVIEW_DIFF_TAIL_CHARS);
+  const tailBoundaryGit = tailSection.indexOf('\ndiff --git');
+  const tailBoundaryHunk = tailSection.indexOf('\n@@');
+  let tailBoundary = -1;
+  if (tailBoundaryGit >= 0 && tailBoundaryHunk >= 0) {
+    tailBoundary = Math.min(tailBoundaryGit, tailBoundaryHunk);
+  } else {
+    tailBoundary = tailBoundaryGit >= 0 ? tailBoundaryGit : tailBoundaryHunk;
+  }
+  const tail = tailBoundary > 0 ? tailSection.slice(tailBoundary) : tailSection;
   return { text: `${head}\n...[truncated]...\n${tail}`, truncated: true };
 };
 
@@ -206,28 +221,22 @@ const buildFileTree = (files: string[]): FileTreeNode[] => {
   return toArray(root);
 };
 
+const GIT_STATUS_LABELS: Record<string, string> = {
+  '?': 'Untracked',
+  A: 'Added',
+  D: 'Deleted',
+  R: 'Renamed',
+  C: 'Copied',
+  M: 'Modified',
+};
+
 const formatGitStatus = (entry: GitStatusEntry) => {
   const index = entry.indexStatus.trim();
   const worktree = entry.worktreeStatus.trim();
   if (index === '?' && worktree === '?') {
-    return 'Untracked';
+    return GIT_STATUS_LABELS['?'];
   }
-  if (index === 'A' || worktree === 'A') {
-    return 'Added';
-  }
-  if (index === 'D' || worktree === 'D') {
-    return 'Deleted';
-  }
-  if (index === 'R' || worktree === 'R') {
-    return 'Renamed';
-  }
-  if (index === 'C' || worktree === 'C') {
-    return 'Copied';
-  }
-  if (index === 'M' || worktree === 'M') {
-    return 'Modified';
-  }
-  return 'Updated';
+  return GIT_STATUS_LABELS[index] ?? GIT_STATUS_LABELS[worktree] ?? 'Updated';
 };
 
 const writeJson = (key: string, value: unknown) => {
@@ -1086,11 +1095,11 @@ export default function AppShell() {
   const loadReviewSettings = useCallback(async () => {
     try {
       const entries = await invoke<SettingsEntry[]>('listSettings');
-      const byKey = new Map(entries.map((entry) => [entry.key, entry.value]));
+      const byKey = new Map(entries.map((entry) => [entry.key, entry.value]));  
       setReviewModel(byKey.get('review_model') ?? null);
-      setReviewThinkingLevel(byKey.get('review_thinking_level') ?? null);
+      setReviewThinkingLevel(byKey.get('review_thinking_level') ?? null);       
     } catch (err) {
-      setSessionListError((prev) => prev ?? String(err));
+      console.warn('Failed to load review settings:', err);
     }
   }, []);
 
@@ -1894,13 +1903,8 @@ export default function AppShell() {
     setSendError(null);
     setActiveView('workspace');
     const modelId = reviewModel ?? getDefaultModel('codex');
-    if (!modelId) {
-      setSendError('No review model configured.');
-      return;
-    }
     const agentType =
-      MODEL_LOOKUP.agentById.get(modelId) ??
-      (newChatAgentType === 'claude' ? 'claude' : 'codex');
+      (modelId ? MODEL_LOOKUP.agentById.get(modelId) : null) ?? 'codex';
     let session: SessionRecord;
     try {
       session = await createSessionForWorkspace(activeWorkspaceId, agentType, modelId);
@@ -1923,6 +1927,7 @@ export default function AppShell() {
       diffTruncated = truncated.truncated;
     } catch (err) {
       setSendError(String(err));
+      return;
     }
     const thinking = reviewThinkingLevel ?? 'medium';
     const promptLines = [
@@ -1957,7 +1962,6 @@ export default function AppShell() {
   }, [
     activeWorkspaceId,
     createSessionForWorkspace,
-    newChatAgentType,
     permissionModeBySession,
     reviewModel,
     reviewThinkingLevel,
