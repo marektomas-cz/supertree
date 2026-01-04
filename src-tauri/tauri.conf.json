@@ -23,6 +23,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": "all",
+    "resources": [
+      "../sidecar/dist/index.js"
+    ]
   }
 }

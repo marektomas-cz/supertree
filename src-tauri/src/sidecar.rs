@@ -10,7 +10,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
+use tauri::path::BaseDirectory;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
@@ -205,6 +206,9 @@ impl SidecarManager {
     options: Value,
     turn_id: i64,
   ) -> Result<(), String> {
+    if !matches!(agent_type, "claude" | "codex") {
+      return Err(format!("Unknown agent type: {agent_type}"));
+    }
     let session = self.ensure_session(session_id).await?;
     {
       let mut state = session.streaming.lock().await;
@@ -316,7 +320,7 @@ impl SidecarManager {
     // Per session: one child process, one socket connection, and stdio FDs (~4-6 total).
     // Memory is dominated by the Node runtime + SDK (rough order: tens of MB per session).
     // No pooling/limit yet; keep session counts bounded (TODO: pool/max sessions if needed).
-    let (child, socket_path) = spawn_sidecar_process()?;
+    let (child, socket_path) = spawn_sidecar_process(&self.app_handle)?;
     let (reader, writer) = connect_socket(&socket_path).await?;
     let session = Arc::new(SidecarSession {
       session_id: session_id.to_string(),
@@ -671,8 +675,8 @@ async fn handle_sidecar_message(
   });
   let metadata_str = metadata.to_string();
 
-  let message_id = match stream_state.assistant_message_id.clone() {
-    Some(id) => id,
+  let (message_id, inserted) = match stream_state.assistant_message_id.clone() {
+    Some(id) => (id, false),
     None => {
       let new_id = sessions::generate_message_id(db.pool()).await.map_err(|err| err.to_string())?;
       sessions::insert_session_message(
@@ -689,13 +693,15 @@ async fn handle_sidecar_message(
       .await
       .map_err(|err| err.to_string())?;
       stream_state.assistant_message_id = Some(new_id.clone());
-      new_id
+      (new_id, true)
     }
   };
 
-  sessions::update_session_message_content(db.pool(), &message_id, &content, Some(&metadata_str))
-    .await
-    .map_err(|err| err.to_string())?;
+  if !inserted {
+    sessions::update_session_message_content(db.pool(), &message_id, &content, Some(&metadata_str))
+      .await
+      .map_err(|err| err.to_string())?;
+  }
 
   let streaming = !payload.is_final.unwrap_or(false);
   let _ = app_handle.emit(
@@ -846,8 +852,8 @@ fn id_to_key(id: &Value) -> String {
   }
 }
 
-fn spawn_sidecar_process() -> Result<(Child, String), String> {
-  let entry = sidecar_entry()?;
+fn spawn_sidecar_process(app_handle: &AppHandle) -> Result<(Child, String), String> {
+  let entry = sidecar_entry(app_handle)?;
   let mut child = Command::new("node")
     .arg(entry)
     .stdout(Stdio::piped())
@@ -884,7 +890,15 @@ fn spawn_sidecar_process() -> Result<(Child, String), String> {
   Ok((child, socket_path))
 }
 
-fn sidecar_entry() -> Result<PathBuf, String> {
+fn sidecar_entry(app_handle: &AppHandle) -> Result<PathBuf, String> {
+  let resource_path = app_handle
+    .path()
+    .resolve("sidecar/dist/index.js", BaseDirectory::Resource)
+    .map_err(|err| err.to_string())?;
+  if resource_path.exists() {
+    return Ok(resource_path);
+  }
+
   let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
   let root = manifest_dir
     .parent()
