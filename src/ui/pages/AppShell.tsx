@@ -483,6 +483,7 @@ export default function AppShell() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [linkIssueOpen, setLinkIssueOpen] = useState(false);
   const [linkIssueValue, setLinkIssueValue] = useState('');
+  // Link issue state is UI-only by design for M07.
   const [linkedIssueBySession, setLinkedIssueBySession] = useState<
     Record<string, string>
   >({});
@@ -3211,6 +3212,7 @@ export default function AppShell() {
                 return (
                   <div
                     key={session.id}
+                    title="Middle-click to close"
                     onMouseDown={(event) => {
                       if (event.button === 1) {
                         event.preventDefault();
