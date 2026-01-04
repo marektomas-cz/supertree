@@ -10,6 +10,10 @@ export type WorkspaceInfo = {
   basePort?: number | null;
   setupLogPath?: string | null;
   archiveLogPath?: string | null;
+  intendedTargetBranch?: string | null;
+  prNumber?: number | null;
+  prUrl?: string | null;
+  prLastCommentId?: string | null;
 };
 
 export type FilePreview = {

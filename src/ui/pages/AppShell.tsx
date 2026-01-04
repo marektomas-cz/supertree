@@ -92,6 +92,50 @@ type WorkspaceDiffResponse = {
   diff: string;
 };
 
+type GithubAuthStatus = {
+  available: boolean;
+  authenticated: boolean;
+  message?: string | null;
+};
+
+type PullRequestInfo = {
+  number: number;
+  url: string;
+  baseBranch: string;
+  headBranch: string;
+};
+
+type PullRequestCheck = {
+  name: string;
+  status?: string | null;
+  conclusion?: string | null;
+  detailsUrl?: string | null;
+};
+
+type PullRequestCheckSummary = {
+  total: number;
+  failed: number;
+  pending: number;
+  success: number;
+};
+
+type PullRequestStatus = {
+  number: number;
+  url: string;
+  baseBranch: string;
+  headBranch: string;
+  reviewDecision?: string | null;
+  mergeable?: string | null;
+  state?: string | null;
+  checks: PullRequestCheckSummary;
+  failingChecks: PullRequestCheck[];
+};
+
+type PullRequestCommentsResult = {
+  content: string;
+  newComments: boolean;
+};
+
 type FileTreeNode = {
   name: string;
   path: string;
@@ -588,6 +632,22 @@ export default function AppShell() {
   >({});
   const [diffHistoryExpandedByMessage, setDiffHistoryExpandedByMessage] =
     useState<Record<string, boolean>>({});
+  const [githubAuthStatus, setGithubAuthStatus] =
+    useState<GithubAuthStatus | null>(null);
+  const [githubAuthLoading, setGithubAuthLoading] = useState(false);
+  const [repoBranchesByRepoId, setRepoBranchesByRepoId] = useState<
+    Record<string, string[]>
+  >({});
+  const [pullRequestStatusByWorkspace, setPullRequestStatusByWorkspace] =
+    useState<Record<string, PullRequestStatus | null>>({});
+  const [pullRequestStatusErrorByWorkspace, setPullRequestStatusErrorByWorkspace] =
+    useState<Record<string, string | null>>({});
+  const [pullRequestStatusLoadingByWorkspace, setPullRequestStatusLoadingByWorkspace] =
+    useState<Record<string, boolean>>({});
+  const [pullRequestActionErrorByWorkspace, setPullRequestActionErrorByWorkspace] =
+    useState<Record<string, string | null>>({});
+  const [pullRequestActionLoadingByWorkspace, setPullRequestActionLoadingByWorkspace] =
+    useState<Record<string, boolean>>({});
   const [reviewModel, setReviewModel] = useState<string | null>(null);
   const [reviewThinkingLevel, setReviewThinkingLevel] = useState<string | null>(
     null,
@@ -849,6 +909,88 @@ export default function AppShell() {
   const activeTerminalId = activeWorkspaceId
     ? activeTerminalByWorkspace[activeWorkspaceId] ?? activeTerminalSessions[0]?.id ?? null
     : null;
+  const activeWorkspace = useMemo(() => {
+    if (!activeWorkspaceId) {
+      return null;
+    }
+    return workspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? null;
+  }, [activeWorkspaceId, workspaces]);
+  const activeRepo = useMemo(() => {
+    if (!activeWorkspace) {
+      return null;
+    }
+    return repos.find((repo) => repo.id === activeWorkspace.repoId) ?? null;
+  }, [activeWorkspace, repos]);
+  const activeTargetBranch =
+    activeWorkspace?.intendedTargetBranch ??
+    activeRepo?.defaultBranch ??
+    null;
+  const activePullRequestStatus = activeWorkspaceId
+    ? pullRequestStatusByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const activePullRequestError = activeWorkspaceId
+    ? pullRequestStatusErrorByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const activePullRequestLoading = activeWorkspaceId
+    ? pullRequestStatusLoadingByWorkspace[activeWorkspaceId] ?? false
+    : false;
+  const activePullRequestActionError = activeWorkspaceId
+    ? pullRequestActionErrorByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const activePullRequestActionLoading = activeWorkspaceId
+    ? pullRequestActionLoadingByWorkspace[activeWorkspaceId] ?? false
+    : false;
+  const activeRepoBranches = useMemo(
+    () => (activeRepo ? repoBranchesByRepoId[activeRepo.id] ?? [] : []),
+    [activeRepo, repoBranchesByRepoId],
+  );
+  const targetBranchOptions = useMemo(() => {
+    const options = new Set<string>();
+    for (const branch of activeRepoBranches) {
+      if (branch.trim()) {
+        options.add(branch);
+      }
+    }
+    if (activeRepo?.defaultBranch) {
+      options.add(activeRepo.defaultBranch);
+    }
+    if (activeWorkspace?.intendedTargetBranch) {
+      options.add(activeWorkspace.intendedTargetBranch);
+    }
+    return Array.from(options).sort((a, b) => a.localeCompare(b));
+  }, [activeRepo, activeRepoBranches, activeWorkspace]);
+  const activePullRequestNumber =
+    activePullRequestStatus?.number ?? activeWorkspace?.prNumber ?? null;
+  const activePullRequestUrl =
+    activePullRequestStatus?.url ?? activeWorkspace?.prUrl ?? null;
+  const reviewDecisionLabel = useMemo(() => {
+    const decision = activePullRequestStatus?.reviewDecision;
+    if (!decision) {
+      return null;
+    }
+    const normalized = decision.replace(/_/g, ' ').toLowerCase();
+    if (normalized === 'changes requested') {
+      return 'Changes requested';
+    }
+    if (normalized === 'approved') {
+      return 'Approved';
+    }
+    if (normalized === 'review required') {
+      return 'Review required';
+    }
+    return decision;
+  }, [activePullRequestStatus]);
+  const hasChangesRequested =
+    reviewDecisionLabel?.toLowerCase() === 'changes requested';
+  const checksSummaryText = activePullRequestStatus
+    ? `${activePullRequestStatus.checks.failed} / ${activePullRequestStatus.checks.total} checks failed`
+    : null;
+  const hasFailingChecks = Boolean(
+    activePullRequestStatus && activePullRequestStatus.checks.failed > 0,
+  );
+  const githubAvailable = githubAuthStatus?.available ?? false;
+  const githubAuthenticated = githubAuthStatus?.authenticated ?? false;
+  const githubReady = githubAvailable && githubAuthenticated;
   const visibleFileCount = Math.min(fileListVisibleCount, workspaceFiles.length);
   const fileListIsTruncated = workspaceFiles.length > visibleFileCount;
   const showLeftSidebar = leftSidebarVisible && !zenMode;
@@ -1039,6 +1181,99 @@ export default function AppShell() {
     }
   }, []);
 
+  const loadGithubAuthStatus = useCallback(async () => {
+    setGithubAuthLoading(true);
+    try {
+      const status = await invoke<GithubAuthStatus>('getGithubAuthStatus');
+      setGithubAuthStatus(status);
+    } catch (err) {
+      setGithubAuthStatus({
+        available: false,
+        authenticated: false,
+        message: String(err),
+      });
+    } finally {
+      setGithubAuthLoading(false);
+    }
+  }, []);
+
+  const loadRepoBranches = useCallback(
+    async (repoId: string, force = false) => {
+      if (!force && repoBranchesByRepoId[repoId]) {
+        return;
+      }
+      try {
+        const branches = await invoke<string[]>('listRepoBranches', { repoId });
+        setRepoBranchesByRepoId((prev) => ({ ...prev, [repoId]: branches }));
+      } catch {
+        setRepoBranchesByRepoId((prev) => ({
+          ...prev,
+          [repoId]: prev[repoId] ?? [],
+        }));
+      }
+    },
+    [repoBranchesByRepoId],
+  );
+
+  const loadPullRequestStatus = useCallback(
+    async (workspaceId: string, force = false) => {
+      if (!force && pullRequestStatusLoadingByWorkspace[workspaceId]) {
+        return;
+      }
+      if (
+        githubAuthStatus &&
+        (!githubAuthStatus.available || !githubAuthStatus.authenticated)
+      ) {
+        setPullRequestStatusErrorByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: null,
+        }));
+        setPullRequestStatusByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: null,
+        }));
+        setPullRequestStatusLoadingByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: false,
+        }));
+        return;
+      }
+      setPullRequestStatusErrorByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: null,
+      }));
+      setPullRequestStatusLoadingByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: true,
+      }));
+      try {
+        const status = await invoke<PullRequestStatus | null>(
+          'getPullRequestStatus',
+          { workspaceId },
+        );
+        setPullRequestStatusByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: status,
+        }));
+      } catch (err) {
+        setPullRequestStatusErrorByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: String(err),
+        }));
+        setPullRequestStatusByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: null,
+        }));
+      } finally {
+        setPullRequestStatusLoadingByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: false,
+        }));
+      }
+    },
+    [githubAuthStatus, pullRequestStatusLoadingByWorkspace],
+  );
+
   const loadGitStatus = useCallback(async (workspaceId: string) => {
     setGitStatusErrorByWorkspace((prev) => ({ ...prev, [workspaceId]: null }));
     setGitStatusLoadingByWorkspace((prev) => ({ ...prev, [workspaceId]: true }));
@@ -1192,6 +1427,10 @@ export default function AppShell() {
   useEffect(() => {
     void loadReviewSettings();
   }, [loadReviewSettings]);
+
+  useEffect(() => {
+    void loadGithubAuthStatus();
+  }, [loadGithubAuthStatus]);
 
   useEffect(() => {
     if (!activeSessionId) {
@@ -1961,6 +2200,267 @@ export default function AppShell() {
     reviewThinkingLevel,
   ]);
 
+  const sendPromptWithGeneratedAttachment = useCallback(
+    async ({
+      workspaceId,
+      prompt,
+      fileName,
+      content,
+      mimeType,
+    }: {
+      workspaceId: string;
+      prompt: string;
+      fileName: string;
+      content: string;
+      mimeType?: string;
+    }) => {
+      setSendError(null);
+      let session = activeSession;
+      if (!session) {
+        session = await createSessionForWorkspace(
+          workspaceId,
+          newChatAgentType,
+          newChatModelByAgent[newChatAgentType] ??
+            getDefaultModel(newChatAgentType),
+        );
+      }
+      const bytes = Array.from(new TextEncoder().encode(content));
+      const attachment = await invoke<AttachmentRecord>('createAttachment', {
+        sessionId: session.id,
+        fileName,
+        mimeType,
+        bytes,
+      });
+      const permissionMode =
+        session.agentType === 'claude'
+          ? permissionModeBySession[session.id] ?? 'default'
+          : undefined;
+      setSessionErrors((prev) => ({ ...prev, [session.id]: null }));
+      const userMessage = await invoke<SessionMessageRecord>('sendSessionMessage', {
+        sessionId: session.id,
+        prompt,
+        permissionMode,
+        attachmentIds: [attachment.id],
+      });
+      const normalized = normalizeSessionMessage(userMessage);
+      setMessagesBySession((prev) => {
+        const list = prev[session.id] ?? [];
+        return { ...prev, [session.id]: [...list, normalized] };
+      });
+      setSessionStatuses((prev) => ({ ...prev, [session.id]: 'running' }));
+      setActiveTabByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: 'session',
+      }));
+      await loadSessionAttachments(session.id);
+      return session;
+    },
+    [
+      activeSession,
+      createSessionForWorkspace,
+      loadSessionAttachments,
+      newChatAgentType,
+      newChatModelByAgent,
+      permissionModeBySession,
+    ],
+  );
+
+  const handleCreatePullRequest = useCallback(async () => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    if (!githubAuthStatus?.available || !githubAuthStatus.authenticated) {
+      setPullRequestActionErrorByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]:
+          githubAuthStatus?.message ??
+          'GitHub CLI is not authenticated. Run `gh auth login`.',
+      }));
+      return;
+    }
+    setPullRequestActionErrorByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: null,
+    }));
+    setPullRequestActionLoadingByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: true,
+    }));
+    try {
+      await invoke<PullRequestInfo>('createPullRequest', {
+        workspaceId: activeWorkspaceId,
+      });
+      await loadWorkspaces();
+      await loadPullRequestStatus(activeWorkspaceId, true);
+    } catch (err) {
+      setPullRequestActionErrorByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: String(err),
+      }));
+    } finally {
+      setPullRequestActionLoadingByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: false,
+      }));
+    }
+  }, [
+    activeWorkspaceId,
+    githubAuthStatus,
+    loadPullRequestStatus,
+    loadWorkspaces,
+  ]);
+
+  const handleSetTargetBranch = useCallback(
+    async (branch: string) => {
+      if (!activeWorkspaceId) {
+        return;
+      }
+      const trimmed = branch.trim();
+      if (!trimmed || trimmed === activeTargetBranch) {
+        return;
+      }
+      setPullRequestActionErrorByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: null,
+      }));
+      setPullRequestActionLoadingByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: true,
+      }));
+      try {
+        await invoke('setWorkspaceTargetBranch', {
+          workspaceId: activeWorkspaceId,
+          targetBranch: trimmed,
+        });
+        await loadWorkspaces();
+      } catch (err) {
+        setPullRequestActionErrorByWorkspace((prev) => ({
+          ...prev,
+          [activeWorkspaceId]: String(err),
+        }));
+      } finally {
+        setPullRequestActionLoadingByWorkspace((prev) => ({
+          ...prev,
+          [activeWorkspaceId]: false,
+        }));
+      }
+    },
+    [activeTargetBranch, activeWorkspaceId, loadWorkspaces],
+  );
+
+  const handleFixErrors = useCallback(async () => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    setPullRequestActionErrorByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: null,
+    }));
+    setPullRequestActionLoadingByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: true,
+    }));
+    try {
+      const logs = await invoke<string>('getPullRequestFailureLogs', {
+        workspaceId: activeWorkspaceId,
+      });
+      const trimmed = logs.trim();
+      if (!trimmed) {
+        setPullRequestActionErrorByWorkspace((prev) => ({
+          ...prev,
+          [activeWorkspaceId]: 'No failing check logs were returned.',
+        }));
+        return;
+      }
+      const prNumber =
+        activePullRequestStatus?.number ?? activeWorkspace?.prNumber ?? null;
+      const promptLines = [
+        prNumber ? `Fix the CI failures for PR #${prNumber}.` : 'Fix the CI failures for this PR.',
+        'Review the attached logs and apply the necessary code changes.',
+      ];
+      await sendPromptWithGeneratedAttachment({
+        workspaceId: activeWorkspaceId,
+        prompt: promptLines.join('\n'),
+        fileName: prNumber ? `pr-${prNumber}-checks.log` : 'pr-checks.log',
+        content: logs,
+        mimeType: 'text/plain',
+      });
+    } catch (err) {
+      setPullRequestActionErrorByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: String(err),
+      }));
+    } finally {
+      setPullRequestActionLoadingByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: false,
+      }));
+    }
+  }, [
+    activePullRequestStatus,
+    activeWorkspace,
+    activeWorkspaceId,
+    sendPromptWithGeneratedAttachment,
+  ]);
+
+  const handleFetchComments = useCallback(async () => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    setPullRequestActionErrorByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: null,
+    }));
+    setPullRequestActionLoadingByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: true,
+    }));
+    try {
+      const result = await invoke<PullRequestCommentsResult>('fetchPullRequestComments', {
+        workspaceId: activeWorkspaceId,
+      });
+      if (!result.content.trim()) {
+        setPullRequestActionErrorByWorkspace((prev) => ({
+          ...prev,
+          [activeWorkspaceId]: 'No review comments found for this PR.',
+        }));
+        return;
+      }
+      const prNumber =
+        activePullRequestStatus?.number ?? activeWorkspace?.prNumber ?? null;
+      const promptLines = [
+        prNumber
+          ? `Review comments fetched for PR #${prNumber}.`
+          : 'Review comments fetched for this PR.',
+        'Please address the requested changes using the attached feedback.',
+      ];
+      await sendPromptWithGeneratedAttachment({
+        workspaceId: activeWorkspaceId,
+        prompt: promptLines.join('\n'),
+        fileName: prNumber ? `pr-${prNumber}-comments.md` : 'pr-comments.md',
+        content: result.content,
+        mimeType: 'text/markdown',
+      });
+      await loadWorkspaces();
+    } catch (err) {
+      setPullRequestActionErrorByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: String(err),
+      }));
+    } finally {
+      setPullRequestActionLoadingByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: false,
+      }));
+    }
+  }, [
+    activePullRequestStatus,
+    activeWorkspace,
+    activeWorkspaceId,
+    loadWorkspaces,
+    sendPromptWithGeneratedAttachment,
+  ]);
+
   const handleCancelSession = useCallback(async () => {
     if (!activeSession) {
       return;
@@ -2559,6 +3059,20 @@ export default function AppShell() {
   ]);
 
   useEffect(() => {
+    if (!activeWorkspaceId || !activeWorkspace || !activeRepo) {
+      return;
+    }
+    void loadRepoBranches(activeRepo.id);
+    void loadPullRequestStatus(activeWorkspaceId);
+  }, [
+    activeRepo,
+    activeWorkspace,
+    activeWorkspaceId,
+    loadPullRequestStatus,
+    loadRepoBranches,
+  ]);
+
+  useEffect(() => {
     if (!activeWorkspaceId) {
       return;
     }
@@ -2639,7 +3153,16 @@ export default function AppShell() {
     loadGitStatus(activeWorkspaceId);
     const selected = selectedDiffPathByWorkspace[activeWorkspaceId] ?? null;
     loadWorkspaceDiff(activeWorkspaceId, selected);
-  }, [activeWorkspaceId, loadGitStatus, loadWorkspaceDiff, selectedDiffPathByWorkspace]);
+    void loadPullRequestStatus(activeWorkspaceId, true);
+    void loadGithubAuthStatus();
+  }, [
+    activeWorkspaceId,
+    loadGitStatus,
+    loadGithubAuthStatus,
+    loadPullRequestStatus,
+    loadWorkspaceDiff,
+    selectedDiffPathByWorkspace,
+  ]);
 
   const renderFileTree = useCallback(
     (nodes: FileTreeNode[], depth = 0) => {
@@ -4386,7 +4909,13 @@ export default function AppShell() {
                 </div>
               </div>
               <div className="mt-3 flex gap-2">
-                <Button size="sm" disabled={!activeWorkspaceId}>
+                <Button
+                  size="sm"
+                  disabled={
+                    !activeWorkspaceId || !githubReady || activePullRequestActionLoading
+                  }
+                  onClick={handleCreatePullRequest}
+                >
                   Create PR
                 </Button>
                 <Button
@@ -4406,6 +4935,116 @@ export default function AppShell() {
                   Refresh
                 </Button>
               </div>
+              {githubAuthLoading ? (
+                <div className="mt-3 rounded-md border border-slate-800 bg-slate-900/40 px-3 py-2 text-xs text-slate-400">
+                  Checking GitHub authentication...
+                </div>
+              ) : githubAuthStatus &&
+                (!githubAuthStatus.available || !githubAuthStatus.authenticated) ? (
+                <div className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                  {githubAuthStatus.message ??
+                    'GitHub CLI is not authenticated. Run `gh auth login` to enable PR features.'}
+                </div>
+              ) : null}
+              {activeWorkspaceId ? (
+                <div className="mt-3 space-y-3 text-xs text-slate-400">
+                  <label className="flex flex-wrap items-center gap-2">
+                    <span className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
+                      Targeting
+                    </span>
+                    <select
+                      value={activeTargetBranch ?? ''}
+                      onChange={(event) => handleSetTargetBranch(event.target.value)}
+                      disabled={targetBranchOptions.length === 0}
+                      className="rounded-md border border-slate-800 bg-slate-950 px-2 py-1 text-[11px] uppercase tracking-widest text-slate-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500"
+                    >
+                      {targetBranchOptions.length === 0 ? (
+                        <option value="">No branches</option>
+                      ) : (
+                        targetBranchOptions.map((branch) => (
+                          <option key={branch} value={branch}>
+                            origin/{branch}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </label>
+                  <div className="rounded-md border border-slate-800 bg-slate-950/40 p-3">
+                    <div className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
+                      Pull request
+                    </div>
+                    {activePullRequestLoading ? (
+                      <div className="mt-2 text-xs text-slate-500">
+                        Loading PR status...
+                      </div>
+                    ) : activePullRequestUrl ? (
+                      <div className="mt-2 space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="text-sm text-slate-200">
+                            PR {activePullRequestNumber ? `#${activePullRequestNumber}` : ''}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleCopyMessage(activePullRequestUrl)}
+                            className="rounded-md border border-slate-800 px-2 py-1 text-[10px] uppercase tracking-widest text-slate-500 transition hover:bg-slate-900 hover:text-slate-100"
+                          >
+                            Copy link
+                          </button>
+                        </div>
+                        <div className="truncate text-[11px] text-slate-500">
+                          {activePullRequestUrl}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="mt-2 text-xs text-slate-500">No PR yet.</div>
+                    )}
+                    {reviewDecisionLabel ? (
+                      <div className="mt-2 text-xs text-slate-400">
+                        Review: {reviewDecisionLabel}
+                      </div>
+                    ) : null}
+                    {checksSummaryText ? (
+                      <div className="mt-2 text-xs text-slate-400">
+                        Checks: {checksSummaryText}
+                      </div>
+                    ) : null}
+                    {hasFailingChecks ? (
+                      <div className="mt-3">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={!githubReady || activePullRequestActionLoading}
+                          onClick={handleFixErrors}
+                        >
+                          Fix Errors
+                        </Button>
+                      </div>
+                    ) : null}
+                    {hasChangesRequested ? (
+                      <div className="mt-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={!githubReady || activePullRequestActionLoading}
+                          onClick={handleFetchComments}
+                        >
+                          Fetch comments
+                        </Button>
+                      </div>
+                    ) : null}
+                  </div>
+                  {activePullRequestActionError ? (
+                    <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                      {activePullRequestActionError}
+                    </div>
+                  ) : null}
+                  {activePullRequestError ? (
+                    <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                      {activePullRequestError}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
               <div className="mt-4 flex gap-2">
                 <button
                   type="button"

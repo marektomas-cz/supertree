@@ -22,6 +22,10 @@ pub struct WorkspaceRecord {
   pub base_port: Option<i64>,
   pub setup_log_path: Option<String>,
   pub archive_log_path: Option<String>,
+  pub intended_target_branch: Option<String>,
+  pub pr_number: Option<i64>,
+  pub pr_url: Option<String>,
+  pub pr_last_comment_id: Option<String>,
 }
 
 /// Data required to insert a new workspace record.
@@ -35,6 +39,10 @@ pub struct NewWorkspace {
   pub base_port: Option<i64>,
   pub setup_log_path: Option<String>,
   pub archive_log_path: Option<String>,
+  pub intended_target_branch: Option<String>,
+  pub pr_number: Option<i64>,
+  pub pr_url: Option<String>,
+  pub pr_last_comment_id: Option<String>,
 }
 
 pub fn active_state() -> &'static str {
@@ -73,7 +81,7 @@ pub async fn allocate_base_port(pool: &SqlitePool) -> Result<i64, DbError> {
 pub async fn list_workspaces(pool: &SqlitePool) -> Result<Vec<WorkspaceRecord>, DbError> {
   let rows = sqlx::query_as::<_, WorkspaceRecord>(
     "SELECT id, repo_id, branch, directory_name, path, state, pinned_at, unread, base_port
-            , setup_log_path, archive_log_path
+            , setup_log_path, archive_log_path, intended_target_branch, pr_number, pr_url, pr_last_comment_id
      FROM workspaces
      ORDER BY created_at DESC",
   )
@@ -85,7 +93,7 @@ pub async fn list_workspaces(pool: &SqlitePool) -> Result<Vec<WorkspaceRecord>, 
 pub async fn get_workspace(pool: &SqlitePool, workspace_id: &str) -> Result<WorkspaceRecord, DbError> {
   let row = sqlx::query_as::<_, WorkspaceRecord>(
     "SELECT id, repo_id, branch, directory_name, path, state, pinned_at, unread, base_port
-            , setup_log_path, archive_log_path
+            , setup_log_path, archive_log_path, intended_target_branch, pr_number, pr_url, pr_last_comment_id
      FROM workspaces
      WHERE id = ?",
   )
@@ -114,8 +122,9 @@ pub async fn find_active_workspace_for_branch(
 pub async fn insert_workspace(pool: &SqlitePool, new_workspace: NewWorkspace) -> Result<WorkspaceRecord, DbError> {
   let result = sqlx::query(
     "INSERT INTO workspaces
-      (id, repo_id, branch, directory_name, path, state, base_port, setup_log_path, archive_log_path)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      (id, repo_id, branch, directory_name, path, state, base_port, setup_log_path, archive_log_path,
+       intended_target_branch, pr_number, pr_url, pr_last_comment_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   )
   .bind(&new_workspace.id)
   .bind(&new_workspace.repo_id)
@@ -126,6 +135,10 @@ pub async fn insert_workspace(pool: &SqlitePool, new_workspace: NewWorkspace) ->
   .bind(new_workspace.base_port)
   .bind(&new_workspace.setup_log_path)
   .bind(&new_workspace.archive_log_path)
+  .bind(&new_workspace.intended_target_branch)
+  .bind(new_workspace.pr_number)
+  .bind(&new_workspace.pr_url)
+  .bind(&new_workspace.pr_last_comment_id)
   .execute(pool)
   .await;
   match result {
@@ -214,6 +227,68 @@ pub async fn set_workspace_unread(
      WHERE id = ?",
   )
   .bind(unread)
+  .bind(workspace_id)
+  .execute(pool)
+  .await?;
+  if result.rows_affected() == 0 {
+    return Err(DbError::NotFound(format!("Workspace not found: {workspace_id}")));
+  }
+  Ok(())
+}
+
+pub async fn set_workspace_target_branch(
+  pool: &SqlitePool,
+  workspace_id: &str,
+  target_branch: Option<&str>,
+) -> Result<(), DbError> {
+  let result = sqlx::query(
+    "UPDATE workspaces
+     SET intended_target_branch = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?",
+  )
+  .bind(target_branch)
+  .bind(workspace_id)
+  .execute(pool)
+  .await?;
+  if result.rows_affected() == 0 {
+    return Err(DbError::NotFound(format!("Workspace not found: {workspace_id}")));
+  }
+  Ok(())
+}
+
+pub async fn set_workspace_pr_info(
+  pool: &SqlitePool,
+  workspace_id: &str,
+  pr_number: Option<i64>,
+  pr_url: Option<&str>,
+) -> Result<(), DbError> {
+  let result = sqlx::query(
+    "UPDATE workspaces
+     SET pr_number = ?, pr_url = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?",
+  )
+  .bind(pr_number)
+  .bind(pr_url)
+  .bind(workspace_id)
+  .execute(pool)
+  .await?;
+  if result.rows_affected() == 0 {
+    return Err(DbError::NotFound(format!("Workspace not found: {workspace_id}")));
+  }
+  Ok(())
+}
+
+pub async fn set_workspace_pr_last_comment_id(
+  pool: &SqlitePool,
+  workspace_id: &str,
+  last_comment_id: Option<&str>,
+) -> Result<(), DbError> {
+  let result = sqlx::query(
+    "UPDATE workspaces
+     SET pr_last_comment_id = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?",
+  )
+  .bind(last_comment_id)
   .bind(workspace_id)
   .execute(pool)
   .await?;
