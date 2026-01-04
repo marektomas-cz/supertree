@@ -8,6 +8,8 @@ export type WorkspaceInfo = {
   pinnedAt?: string | null;
   unread: boolean;
   basePort?: number | null;
+  setupLogPath?: string | null;
+  archiveLogPath?: string | null;
 };
 
 export type FilePreview = {

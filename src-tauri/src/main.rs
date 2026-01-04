@@ -8,13 +8,20 @@ mod settings;
 mod workspace;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
-use std::time::Duration;
-use tauri::Manager;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::{Emitter, Manager};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use libc;
 
 use crate::db::{Database, DbError};
 use crate::git::{
@@ -44,6 +51,55 @@ struct FilePreview {
   content: String,
   truncated: bool,
   binary: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RunOutputEvent {
+  workspace_id: String,
+  stream: String,
+  line: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RunExitEvent {
+  workspace_id: String,
+  code: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalOutputEvent {
+  terminal_id: String,
+  data: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalExitEvent {
+  terminal_id: String,
+}
+
+#[derive(Default, Clone)]
+struct RunManager {
+  processes: Arc<Mutex<HashMap<String, RunProcess>>>,
+}
+
+struct RunProcess {
+  pid: u32,
+  repo_id: String,
+}
+
+#[derive(Default, Clone)]
+struct TerminalManager {
+  sessions: Arc<Mutex<HashMap<String, TerminalSession>>>,
+}
+
+struct TerminalSession {
+  master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+  writer: Arc<Mutex<Box<dyn Write + Send>>>,
+  child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +355,31 @@ async fn createWorkspace(
     return Err(err);
   }
 
+  let env_vars_raw = settings::get_env_vars(db.pool())
+    .await
+    .map_err(|err| err.to_string())?;
+  let setup_log_path = repo
+    .scripts_setup
+    .as_ref()
+    .filter(|value| !value.trim().is_empty())
+    .map(|_| build_log_path(&paths, "setup", &id));
+  if let (Some(script), Some(log_path)) = (&repo.scripts_setup, &setup_log_path) {
+    let envs = build_workspace_env(
+      &repo,
+      &id,
+      Some(&directory_name),
+      &workspace_path,
+      Some(base_port),
+      &env_vars_raw,
+    );
+    if let Err(err) = run_workspace_script_with_log(script, &workspace_path, &envs, log_path) {
+      let _ = remove_worktree(&repo_root, &workspace_path);
+      let _ = fs::remove_dir_all(&workspace_path);
+      return Err(err);
+    }
+  }
+  let setup_log_path = setup_log_path.map(|path| path.to_string_lossy().to_string());
+
   let new_workspace = workspace::NewWorkspace {
     id: id.clone(),
     repo_id: repo_id.clone(),
@@ -307,6 +388,8 @@ async fn createWorkspace(
     path: workspace_path.to_string_lossy().to_string(),
     state: workspace::active_state().to_string(),
     base_port: Some(base_port),
+    setup_log_path,
+    archive_log_path: None,
   };
 
   match workspace::insert_workspace(db.pool(), new_workspace).await {
@@ -365,7 +448,23 @@ async fn archiveWorkspace(
     if !allow_script {
       return Err("Archive script requires confirmation.".to_string());
     }
-    run_workspace_script(script, &workspace_path, workspace_record.base_port)?;
+    let env_vars_raw = settings::get_env_vars(db.pool())
+      .await
+      .map_err(|err| err.to_string())?;
+    let archive_log_path = build_log_path(&paths, "archive", &workspace_id);
+    let archive_log_path_str = archive_log_path.to_string_lossy().to_string();
+    workspace::set_workspace_archive_log_path(db.pool(), &workspace_id, &archive_log_path_str)
+      .await
+      .map_err(|err| err.to_string())?;
+    let envs = build_workspace_env(
+      &repo,
+      &workspace_id,
+      workspace_record.directory_name.as_deref(),
+      &workspace_path,
+      workspace_record.base_port,
+      &env_vars_raw,
+    );
+    run_workspace_script_with_log(script, &workspace_path, &envs, &archive_log_path)?;
   }
 
   if workspace_path.exists() {
@@ -520,6 +619,360 @@ async fn readWorkspaceFile(
   tauri::async_runtime::spawn_blocking(move || read_workspace_file(&root, &path))
     .await
     .map_err(|err| err.to_string())?
+}
+
+fn spawn_run_output_reader(
+  reader: impl Read + Send + 'static,
+  window: tauri::Window,
+  workspace_id: String,
+  stream: &'static str,
+) {
+  std::thread::spawn(move || {
+    let buffer = BufReader::new(reader);
+    for line in buffer.lines() {
+      match line {
+        Ok(line) => {
+          let payload = RunOutputEvent {
+            workspace_id: workspace_id.clone(),
+            stream: stream.to_string(),
+            line,
+          };
+          let _ = window.emit("run-output", payload);
+        }
+        Err(err) => {
+          eprintln!("[run-output] stream error: {err}");
+          break;
+        }
+      }
+    }
+  });
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn startRunScript(
+  window: tauri::Window,
+  db: tauri::State<'_, Database>,
+  paths: tauri::State<'_, AppPaths>,
+  run_manager: tauri::State<'_, RunManager>,
+  workspace_id: String,
+) -> Result<(), String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo = repos::get_repo_by_id(db.pool(), &workspace_record.repo_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let script = repo
+    .scripts_run
+    .as_ref()
+    .filter(|value| !value.trim().is_empty())
+    .ok_or_else(|| "Run script is not configured for this repository.".to_string())?;
+  let env_vars_raw = settings::get_env_vars(db.pool())
+    .await
+    .map_err(|err| err.to_string())?;
+  let root = resolve_workspace_root(&paths, Path::new(&workspace_record.path))?;
+  let envs = build_workspace_env(
+    &repo,
+    &workspace_id,
+    workspace_record.directory_name.as_deref(),
+    &root,
+    workspace_record.base_port,
+    &env_vars_raw,
+  );
+  let target_repo_id = repo.id.clone();
+  if repo.run_script_mode.as_deref() == Some("nonconcurrent") {
+    let pids = {
+      let guard = run_manager
+        .processes
+        .lock()
+        .map_err(|_| "Run manager lock poisoned".to_string())?;
+      guard
+        .values()
+        .filter(|process| process.repo_id == target_repo_id)
+        .map(|process| process.pid)
+        .collect::<Vec<_>>()
+    };
+    for pid in pids {
+      terminate_process_tree(pid)?;
+    }
+  }
+
+  let mut command = build_shell_command(script);
+  command.current_dir(&root);
+  apply_env_to_command(&mut command, &envs);
+  command.stdout(Stdio::piped());
+  command.stderr(Stdio::piped());
+  configure_process_group(&mut command);
+  let mut child = command.spawn().map_err(|err| err.to_string())?;
+  let pid = child.id();
+  {
+    let mut guard = run_manager
+      .processes
+      .lock()
+      .map_err(|_| "Run manager lock poisoned".to_string())?;
+    guard.insert(
+      workspace_id.clone(),
+      RunProcess {
+        pid,
+        repo_id: repo.id.clone(),
+      },
+    );
+  }
+  if let Some(stdout) = child.stdout.take() {
+    spawn_run_output_reader(stdout, window.clone(), workspace_id.clone(), "stdout");
+  }
+  if let Some(stderr) = child.stderr.take() {
+    spawn_run_output_reader(stderr, window.clone(), workspace_id.clone(), "stderr");
+  }
+
+  let run_manager = run_manager.inner().clone();
+  let window = window.clone();
+  let workspace_id_clone = workspace_id.clone();
+  std::thread::spawn(move || {
+    let status = child.wait().ok();
+    if let Ok(mut guard) = run_manager.processes.lock() {
+      guard.remove(&workspace_id_clone);
+    }
+    let _ = window.emit(
+      "run-exit",
+      RunExitEvent {
+        workspace_id: workspace_id_clone,
+        code: status.and_then(|value| value.code()),
+      },
+    );
+  });
+
+  Ok(())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn stopRunScript(
+  run_manager: tauri::State<'_, RunManager>,
+  workspace_id: String,
+) -> Result<(), String> {
+  let pid = {
+    let guard = run_manager
+      .processes
+      .lock()
+      .map_err(|_| "Run manager lock poisoned".to_string())?;
+    guard.get(&workspace_id).map(|process| process.pid)
+  };
+  if let Some(pid) = pid {
+    terminate_process_tree(pid)?;
+  }
+  Ok(())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn createTerminal(
+  window: tauri::Window,
+  db: tauri::State<'_, Database>,
+  paths: tauri::State<'_, AppPaths>,
+  terminal_manager: tauri::State<'_, TerminalManager>,
+  workspace_id: String,
+  cols: u16,
+  rows: u16,
+) -> Result<String, String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo = repos::get_repo_by_id(db.pool(), &workspace_record.repo_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let env_vars_raw = settings::get_env_vars(db.pool())
+    .await
+    .map_err(|err| err.to_string())?;
+  let root = resolve_workspace_root(&paths, Path::new(&workspace_record.path))?;
+  let envs = build_workspace_env(
+    &repo,
+    &workspace_id,
+    workspace_record.directory_name.as_deref(),
+    &root,
+    workspace_record.base_port,
+    &env_vars_raw,
+  );
+
+  let (shell, args) = default_shell_command();
+  let pty_system = native_pty_system();
+  let size = PtySize {
+    rows: rows.max(1),
+    cols: cols.max(1),
+    pixel_width: 0,
+    pixel_height: 0,
+  };
+  let pair = pty_system
+    .openpty(size)
+    .map_err(|err| err.to_string())?;
+  let mut command = CommandBuilder::new(shell);
+  command.args(args);
+  command.cwd(root);
+  apply_env_to_builder(&mut command, &envs);
+  command.env("TERM", "xterm-256color");
+  let child = pair
+    .slave
+    .spawn_command(command)
+    .map_err(|err| err.to_string())?;
+  drop(pair.slave);
+  let mut reader = pair
+    .master
+    .try_clone_reader()
+    .map_err(|err| err.to_string())?;
+  let writer = pair.master.take_writer().map_err(|err| err.to_string())?;
+  let terminal_id = next_terminal_id();
+  let session = TerminalSession {
+    master: Arc::new(Mutex::new(pair.master)),
+    writer: Arc::new(Mutex::new(writer)),
+    child: Arc::new(Mutex::new(child)),
+  };
+  {
+    let mut guard = terminal_manager
+      .sessions
+      .lock()
+      .map_err(|_| "Terminal manager lock poisoned".to_string())?;
+    guard.insert(terminal_id.clone(), session);
+  }
+
+  let window_reader = window.clone();
+  let terminal_id_reader = terminal_id.clone();
+  std::thread::spawn(move || {
+    let mut buffer = [0u8; 4096];
+    loop {
+      match reader.read(&mut buffer) {
+        Ok(0) => break,
+        Ok(count) => {
+          let data = String::from_utf8_lossy(&buffer[..count]).to_string();
+          let _ = window_reader.emit(
+            "terminal-output",
+            TerminalOutputEvent {
+              terminal_id: terminal_id_reader.clone(),
+              data,
+            },
+          );
+        }
+        Err(err) => {
+          eprintln!("[terminal-output] read error: {err}");
+          break;
+        }
+      }
+    }
+  });
+
+  let terminal_manager = terminal_manager.inner().clone();
+  let window_exit = window.clone();
+  let terminal_id_exit = terminal_id.clone();
+  let child_handle = {
+    let guard = terminal_manager
+      .sessions
+      .lock()
+      .map_err(|_| "Terminal manager lock poisoned".to_string())?;
+    guard
+      .get(&terminal_id_exit)
+      .map(|session| session.child.clone())
+      .ok_or_else(|| "Terminal session not found".to_string())?
+  };
+  std::thread::spawn(move || {
+    let _ = match child_handle.lock() {
+      Ok(mut guard) => guard.wait().ok(),
+      Err(err) => {
+        eprintln!("[terminal-exit] child lock poisoned: {err}");
+        None
+      }
+    };
+    if let Ok(mut guard) = terminal_manager.sessions.lock() {
+      guard.remove(&terminal_id_exit);
+    }
+    let _ = window_exit.emit(
+      "terminal-exit",
+      TerminalExitEvent {
+        terminal_id: terminal_id_exit,
+      },
+    );
+  });
+
+  Ok(terminal_id)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn writeTerminal(
+  terminal_manager: tauri::State<'_, TerminalManager>,
+  terminal_id: String,
+  data: String,
+) -> Result<(), String> {
+  let writer = {
+    let guard = terminal_manager
+      .sessions
+      .lock()
+      .map_err(|_| "Terminal manager lock poisoned".to_string())?;
+    guard
+      .get(&terminal_id)
+      .map(|session| session.writer.clone())
+      .ok_or_else(|| "Terminal session not found".to_string())?
+  };
+  let mut guard = writer
+    .lock()
+    .map_err(|_| "Terminal writer lock poisoned".to_string())?;
+  guard
+    .write_all(data.as_bytes())
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn resizeTerminal(
+  terminal_manager: tauri::State<'_, TerminalManager>,
+  terminal_id: String,
+  cols: u16,
+  rows: u16,
+) -> Result<(), String> {
+  let master = {
+    let guard = terminal_manager
+      .sessions
+      .lock()
+      .map_err(|_| "Terminal manager lock poisoned".to_string())?;
+    guard
+      .get(&terminal_id)
+      .map(|session| session.master.clone())
+      .ok_or_else(|| "Terminal session not found".to_string())?
+  };
+  let guard = master
+    .lock()
+    .map_err(|_| "Terminal master lock poisoned".to_string())?;
+  guard
+    .resize(PtySize {
+      rows: rows.max(1),
+      cols: cols.max(1),
+      pixel_width: 0,
+      pixel_height: 0,
+    })
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn closeTerminal(
+  terminal_manager: tauri::State<'_, TerminalManager>,
+  terminal_id: String,
+) -> Result<(), String> {
+  let session = {
+    let mut guard = terminal_manager
+      .sessions
+      .lock()
+      .map_err(|_| "Terminal manager lock poisoned".to_string())?;
+    guard.remove(&terminal_id)
+  };
+  if let Some(session) = session {
+    let mut child_guard = session
+      .child
+      .lock()
+      .map_err(|_| "Terminal child lock poisoned".to_string())?;
+    let _ = child_guard.kill();
+    let _ = child_guard.wait();
+  }
+  Ok(())
 }
 
 #[allow(non_snake_case)]
@@ -726,26 +1179,196 @@ fn read_workspace_file(root: &Path, relative_path: &str) -> Result<FilePreview, 
   })
 }
 
-fn run_workspace_script(
-  script: &str,
+static TERMINAL_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+fn next_terminal_id() -> String {
+  let next = TERMINAL_COUNTER.fetch_add(1, Ordering::SeqCst);
+  format!("terminal-{next}")
+}
+
+fn timestamp_millis() -> u128 {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_millis()
+}
+
+fn parse_env_vars(raw: &str) -> Vec<(String, String)> {
+  raw.lines()
+    .filter_map(|line| {
+      let trimmed = line.trim();
+      if trimmed.is_empty() {
+        return None;
+      }
+      let without_export = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+      let (key, value) = without_export.split_once('=')?;
+      let key = key.trim();
+      if key.is_empty() {
+        return None;
+      }
+      let value = value.trim();
+      let value = if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+          || (value.starts_with('\'') && value.ends_with('\'')))
+      {
+        &value[1..value.len() - 1]
+      } else {
+        value
+      };
+      Some((key.to_string(), value.to_string()))
+    })
+    .collect()
+}
+
+fn build_workspace_env(
+  repo: &RepoRecord,
+  workspace_id: &str,
+  workspace_name: Option<&str>,
   workspace_path: &Path,
   base_port: Option<i64>,
+  env_vars_raw: &str,
+) -> Vec<(String, String)> {
+  let mut envs = vec![
+    (
+      "supertree_WORKSPACE_NAME".to_string(),
+      workspace_name.unwrap_or(workspace_id).to_string(),
+    ),
+    (
+      "supertree_WORKSPACE_PATH".to_string(),
+      workspace_path.to_string_lossy().to_string(),
+    ),
+    ("supertree_ROOT_PATH".to_string(), repo.root_path.clone()),
+    (
+      "supertree_DEFAULT_BRANCH".to_string(),
+      repo.default_branch.clone(),
+    ),
+  ];
+  if let Some(port) = base_port {
+    envs.push(("supertree_PORT".to_string(), port.to_string()));
+  }
+  envs.extend(parse_env_vars(env_vars_raw));
+  envs
+}
+
+fn apply_env_to_command(command: &mut Command, envs: &[(String, String)]) {
+  for (key, value) in envs {
+    command.env(key, value);
+  }
+}
+
+fn apply_env_to_builder(builder: &mut CommandBuilder, envs: &[(String, String)]) {
+  for (key, value) in envs {
+    builder.env(key, value);
+  }
+}
+
+fn build_log_path(paths: &AppPaths, kind: &str, workspace_id: &str) -> PathBuf {
+  let stamp = timestamp_millis();
+  paths
+    .logs_dir
+    .join(format!("{kind}-{workspace_id}-{stamp}.log"))
+}
+
+fn run_workspace_script_with_log(
+  script: &str,
+  workspace_path: &Path,
+  envs: &[(String, String)],
+  log_path: &Path,
 ) -> Result<(), String> {
+  let log_file = fs::File::create(log_path).map_err(|err| err.to_string())?;
+  let log_err = log_file.try_clone().map_err(|err| err.to_string())?;
   let mut command = build_shell_command(script);
   command.current_dir(workspace_path);
-  if let Some(port) = base_port {
-    let value = port.to_string();
-    command.env("SUPERTREE_PORT", &value);
-    command.env("supertree_PORT", &value);
-  }
+  apply_env_to_command(&mut command, envs);
+  command.stdout(Stdio::from(log_file));
+  command.stderr(Stdio::from(log_err));
+  configure_process_group(&mut command);
   let status = command.status().map_err(|err| err.to_string())?;
   if !status.success() {
     return Err(format!(
-      "Workspace script failed ({}): exit code {:?}",
+      "Workspace script failed ({}). See log: {}",
       script,
-      status.code()
+      log_path.display()
     ));
   }
+  Ok(())
+}
+
+fn default_shell_command() -> (String, Vec<String>) {
+  #[cfg(target_os = "windows")]
+  {
+    return ("powershell.exe".to_string(), vec!["-NoLogo".to_string()]);
+  }
+
+  #[cfg(target_os = "macos")]
+  {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "zsh".to_string());
+    return (shell, vec!["-l".to_string()]);
+  }
+
+  #[cfg(all(unix, not(target_os = "macos")))]
+  {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
+    return (shell, vec!["-l".to_string()]);
+  }
+}
+
+fn configure_process_group(command: &mut Command) {
+  #[cfg(unix)]
+  {
+    unsafe {
+      let _ = command.pre_exec(|| {
+        unsafe {
+          if libc::setpgid(0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+          }
+        }
+        Ok(())
+      });
+    }
+  }
+  #[cfg(not(unix))]
+  {
+    let _ = command;
+  }
+}
+
+fn terminate_process_tree(pid: u32) -> Result<(), String> {
+  #[cfg(target_os = "windows")]
+  {
+    let status = Command::new("taskkill")
+      .arg("/PID")
+      .arg(pid.to_string())
+      .arg("/T")
+      .arg("/F")
+      .status()
+      .map_err(|err| err.to_string())?;
+    if !status.success() {
+      return Ok(());
+    }
+  }
+
+  #[cfg(unix)]
+  unsafe {
+    let pgid = -(pid as i32);
+    if libc::kill(pgid, libc::SIGTERM) != 0 {
+      let err = std::io::Error::last_os_error();
+      if err.raw_os_error() != Some(libc::ESRCH) {
+        return Err(format!("Failed to terminate process group for pid {pid}: {err}"));
+      }
+    } else {
+      std::thread::sleep(Duration::from_millis(100));
+      if libc::kill(pgid, libc::SIGKILL) != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+          return Err(format!(
+            "Failed to force terminate process group for pid {pid}: {err}"
+          ));
+        }
+      }
+    }
+  }
+
   Ok(())
 }
 
@@ -857,6 +1480,8 @@ fn main() {
         .map_err(|err| err.to_string())?;
       app.manage(paths);
       app.manage(db);
+      app.manage(RunManager::default());
+      app.manage(TerminalManager::default());
       if cfg!(debug_assertions) {
         match SidecarProcess::spawn() {
           Ok(process) => {
@@ -888,6 +1513,12 @@ fn main() {
       setWorkspaceSparseCheckout,
       listWorkspaceFiles,
       readWorkspaceFile,
+      startRunScript,
+      stopRunScript,
+      createTerminal,
+      writeTerminal,
+      resizeTerminal,
+      closeTerminal,
       openPathIn
     ])
     .run(tauri::generate_context!())
