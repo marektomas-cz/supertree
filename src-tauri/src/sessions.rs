@@ -137,6 +137,26 @@ pub async fn set_session_status(
   Ok(())
 }
 
+pub async fn set_session_model(
+  pool: &SqlitePool,
+  session_id: &str,
+  model: Option<&str>,
+) -> Result<(), DbError> {
+  let result = sqlx::query(
+    "UPDATE sessions
+     SET model = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?",
+  )
+  .bind(model)
+  .bind(session_id)
+  .execute(pool)
+  .await?;
+  if result.rows_affected() == 0 {
+    return Err(DbError::NotFound(format!("Session not found: {session_id}")));
+  }
+  Ok(())
+}
+
 pub async fn set_session_codex_id(
   pool: &SqlitePool,
   session_id: &str,

@@ -62,3 +62,14 @@ export type ExitPlanModeEvent = {
   requestId: string;
   sessionId: string;
 };
+
+export type AttachmentRecord = {
+  id: string;
+  sessionId: string;
+  sessionMessageId?: string | null;
+  type: string;
+  title?: string | null;
+  path?: string | null;
+  mimeType?: string | null;
+  isDraft: boolean;
+};
