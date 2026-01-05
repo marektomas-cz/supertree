@@ -87,8 +87,8 @@ CREATE TABLE IF NOT EXISTS settings (
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_sessions_workspace_id ON sessions(workspace_id);
-CREATE INDEX idx_session_messages_session_id ON session_messages(session_id);
-CREATE INDEX idx_session_messages_sent_at ON session_messages(sent_at);
-CREATE INDEX idx_attachments_session_id ON attachments(session_id);
-CREATE INDEX idx_attachments_session_message_id ON attachments(session_message_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_workspace_id ON sessions(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_session_messages_session_id ON session_messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_messages_sent_at ON session_messages(sent_at);
+CREATE INDEX IF NOT EXISTS idx_attachments_session_id ON attachments(session_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_session_message_id ON attachments(session_message_id);
