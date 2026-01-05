@@ -17,3 +17,4 @@ sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "macros"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 portable-pty = "0.8.1"
 libc = "0.2.179"
+notify = "8.2.0"

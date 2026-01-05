@@ -10,7 +10,9 @@ mod repos;
 mod settings;
 mod sessions;
 mod sidecar;
+mod spotlight;
 mod workspace;
+mod workspace_content;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -39,6 +41,8 @@ use crate::checkpoints::{
   restore_checkpoint,
   CheckpointOutcome,
 };
+use crate::spotlight::SpotlightManager;
+use crate::workspace_content::{read_notes, read_todos, write_notes, write_todos, ManualTodoItem};
 use crate::git::{
   branch_exists, clone_repo, create_worktree, diff as git_diff, inspect_repo, is_git_repo,
   list_branches, list_status, read_supertree_config, remove_worktree, repo_name_from_url,
@@ -962,11 +966,35 @@ async fn sendSessionMessage(
     }
   }
 
+  let mut additional_directories: Vec<String> = Vec::new();
+  if let Some(linked_ids) = workspace_record.linked_workspace_ids.clone() {
+    let mut seen = HashSet::new();
+    for linked_id in linked_ids {
+      if !seen.insert(linked_id.clone()) {
+        continue;
+      }
+      match workspace::get_workspace(db.pool(), &linked_id).await {
+        Ok(linked_workspace) => {
+          if linked_workspace.path != workspace_record.path {
+            additional_directories.push(linked_workspace.path);
+          }
+        }
+        Err(err) => {
+          eprintln!(
+            "[sendSessionMessage] skipping linked workspace {}: {}",
+            linked_id, err
+          );
+        }
+      }
+    }
+  }
+
   let options = build_session_query_options(
     &session,
     &workspace_record.path,
     payload.permission_mode.clone(),
     &env_vars_raw,
+    &additional_directories,
     turn_id,
   );
   if let Err(err) = sidecar
@@ -988,6 +1016,7 @@ fn build_session_query_options(
   workspace_path: &str,
   permission_mode: Option<String>,
   env_vars_raw: &str,
+  additional_directories: &[String],
   turn_id: i64,
 ) -> Value {
   let mut options = serde_json::Map::new();
@@ -1039,6 +1068,12 @@ fn build_session_query_options(
       }
       options.insert("conductorEnv".to_string(), Value::Object(env_map));
     }
+  }
+  if !additional_directories.is_empty() {
+    options.insert(
+      "additionalDirectories".to_string(),
+      json!(additional_directories),
+    );
   }
   options.insert("turnId".to_string(), json!(turn_id));
   Value::Object(options)
@@ -1261,6 +1296,44 @@ async fn setWorkspaceSparseCheckout(
 
 #[allow(non_snake_case)]
 #[tauri::command]
+async fn setWorkspaceLinkedWorkspaces(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+  linked_workspace_ids: Vec<String>,
+) -> Result<(), String> {
+  let mut unique_ids: Vec<String> = linked_workspace_ids
+    .into_iter()
+    .map(|id| id.trim().to_string())
+    .filter(|id| !id.is_empty())
+    .collect();
+  unique_ids.sort();
+  unique_ids.dedup();
+  if unique_ids.iter().any(|id| id == &workspace_id) {
+    return Err("Workspace cannot link to itself.".to_string());
+  }
+  for id in &unique_ids {
+    workspace::get_workspace(db.pool(), id)
+      .await
+      .map_err(|err| err.to_string())?;
+  }
+  let linked_json = if unique_ids.is_empty() {
+    None
+  } else {
+    Some(
+      serde_json::to_string(&unique_ids).map_err(|err| err.to_string())?,
+    )
+  };
+  workspace::set_workspace_linked_workspace_ids(
+    db.pool(),
+    &workspace_id,
+    linked_json.as_deref(),
+  )
+  .await
+  .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
 async fn listWorkspaceFiles(
   db: tauri::State<'_, Database>,
   paths: tauri::State<'_, AppPaths>,
@@ -1294,6 +1367,57 @@ async fn readWorkspaceFile(
 
 #[allow(non_snake_case)]
 #[tauri::command]
+async fn getWorkspaceNotes(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+) -> Result<String, String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  read_notes(Path::new(&workspace_record.path))
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn setWorkspaceNotes(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+  content: String,
+) -> Result<(), String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  write_notes(Path::new(&workspace_record.path), &content)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn getWorkspaceTodos(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+) -> Result<Vec<ManualTodoItem>, String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  read_todos(Path::new(&workspace_record.path))
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn setWorkspaceTodos(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+  items: Vec<ManualTodoItem>,
+) -> Result<(), String> {
+  validate_todos(&items)?;
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  write_todos(Path::new(&workspace_record.path), &items)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
 async fn getWorkspaceGitStatus(
   db: tauri::State<'_, Database>,
   workspace_id: String,
@@ -1303,6 +1427,22 @@ async fn getWorkspaceGitStatus(
     .map_err(|err| err.to_string())?;
   let workspace_path = PathBuf::from(workspace_record.path);
   tauri::async_runtime::spawn_blocking(move || list_status(&workspace_path))
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn getBranchSyncStatus(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+) -> Result<git::BranchSyncStatus, String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let workspace_path = PathBuf::from(workspace_record.path);
+  tauri::async_runtime::spawn_blocking(move || git::branch_sync_status(&workspace_path))
     .await
     .map_err(|err| err.to_string())?
     .map_err(|err| err.to_string())
@@ -1335,6 +1475,42 @@ async fn getGithubAuthStatus() -> Result<GithubAuthStatus, String> {
   tauri::async_runtime::spawn_blocking(detect_github_auth_status)
     .await
     .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn getSpotlightStatus(
+  spotlight: tauri::State<'_, SpotlightManager>,
+  workspace_id: String,
+) -> Result<bool, String> {
+  Ok(spotlight.is_active(&workspace_id))
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn enableSpotlight(
+  db: tauri::State<'_, Database>,
+  spotlight: tauri::State<'_, SpotlightManager>,
+  workspace_id: String,
+) -> Result<(), String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo = repos::get_repo_by_id(db.pool(), &workspace_record.repo_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let workspace_path = PathBuf::from(&workspace_record.path);
+  let repo_root = PathBuf::from(&repo.root_path);
+  spotlight.enable(&workspace_id, workspace_path, repo_root)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn disableSpotlight(
+  spotlight: tauri::State<'_, SpotlightManager>,
+  workspace_id: String,
+) -> Result<(), String> {
+  spotlight.disable(&workspace_id)
 }
 
 #[allow(non_snake_case)]
@@ -1467,6 +1643,35 @@ async fn createPullRequest(
   .await
   .map_err(|err| err.to_string())?;
   Ok(info)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn mergePullRequest(
+  db: tauri::State<'_, Database>,
+  workspace_id: String,
+) -> Result<(), String> {
+  let workspace_record = workspace::get_workspace(db.pool(), &workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo = repos::get_repo_by_id(db.pool(), &workspace_record.repo_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let repo_slug = repo
+    .remote_url
+    .as_deref()
+    .and_then(parse_github_repo_slug)
+    .ok_or_else(|| "Repository remote is not a GitHub URL.".to_string())?;
+  let workspace_path = PathBuf::from(&workspace_record.path);
+  let repo_slug_clone = repo_slug.clone();
+  tauri::async_runtime::spawn_blocking(move || {
+    ensure_github_authenticated()?;
+    let status = fetch_pull_request_status(&workspace_path, &repo_slug_clone)?
+      .ok_or_else(|| "No pull request found for this branch.".to_string())?;
+    merge_pull_request(&workspace_path, &repo_slug_clone, status.number)
+  })
+  .await
+  .map_err(|err| err.to_string())?
 }
 
 #[allow(non_snake_case)]
@@ -2023,8 +2228,25 @@ fn build_open_command(path: &PathBuf, target: &OpenTarget) -> Command {
 }
 
 fn ensure_context_dirs(workspace_path: &Path) -> Result<(), String> {
-  let context_dir = workspace_path.join(".context").join("attachments");        
+  let context_dir = workspace_path.join(".context").join("attachments");
   fs::create_dir_all(&context_dir).map_err(|err| err.to_string())
+}
+
+fn validate_todos(items: &[ManualTodoItem]) -> Result<(), String> {
+  let mut ids = HashSet::new();
+  for item in items {
+    let trimmed_id = item.id.trim();
+    if trimmed_id.is_empty() {
+      return Err("Todo id is required.".to_string());
+    }
+    if item.text.trim().is_empty() {
+      return Err("Todo text is required.".to_string());
+    }
+    if !ids.insert(trimmed_id.to_string()) {
+      return Err(format!("Duplicate todo id: {}", trimmed_id));
+    }
+  }
+  Ok(())
 }
 
 fn sanitize_filename(value: &str) -> String {
@@ -2177,6 +2399,29 @@ fn create_pull_request(
   ]);
   configure_gh_command(&mut command);
   run_command_output(&mut command, "gh pr create")?;
+  Ok(())
+}
+
+fn merge_pull_request(
+  workspace_path: &Path,
+  repo_slug: &str,
+  pr_number: i64,
+) -> Result<(), String> {
+  let pr_number_str = pr_number.to_string();
+  let mut command = Command::new("gh");
+  command.current_dir(workspace_path);
+  command.args([
+    "pr",
+    "merge",
+    pr_number_str.as_str(),
+    "--merge",
+    "--delete-branch",
+    "--yes",
+    "--repo",
+    repo_slug,
+  ]);
+  configure_gh_command(&mut command);
+  run_command_output(&mut command, "gh pr merge")?;
   Ok(())
 }
 
@@ -2907,6 +3152,7 @@ fn main() {
       app.manage(RunManager::default());
       app.manage(TerminalManager::default());
       app.manage(sidecar_manager);
+      app.manage(SpotlightManager::default());
       Ok(())
     })
     .on_window_event(|window, event| {
@@ -2948,14 +3194,24 @@ fn main() {
       respondAskUserQuestion,
       respondExitPlanMode,
       setWorkspaceSparseCheckout,
+      setWorkspaceLinkedWorkspaces,
       listWorkspaceFiles,
       readWorkspaceFile,
+      getWorkspaceNotes,
+      setWorkspaceNotes,
+      getWorkspaceTodos,
+      setWorkspaceTodos,
       getWorkspaceGitStatus,
+      getBranchSyncStatus,
       getWorkspaceDiff,
       getGithubAuthStatus,
+      getSpotlightStatus,
+      enableSpotlight,
+      disableSpotlight,
       listRepoBranches,
       setWorkspaceTargetBranch,
       createPullRequest,
+      mergePullRequest,
       getPullRequestStatus,
       getPullRequestFailureLogs,
       fetchPullRequestComments,

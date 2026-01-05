@@ -35,6 +35,14 @@ pub struct GitStatusEntry {
   pub deletions: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchSyncStatus {
+  pub upstream: Option<String>,
+  pub ahead: i64,
+  pub behind: i64,
+}
+
 #[derive(Debug)]
 pub enum GitError {
   Io(std::io::Error),
@@ -345,6 +353,99 @@ pub fn diff(path: &Path, file: Option<&Path>, stat: bool) -> Result<String, GitE
     }
     Err(err) => Err(err),
   }
+}
+
+/// Report ahead/behind counts for the current branch vs upstream (if configured).
+pub fn branch_sync_status(path: &Path) -> Result<BranchSyncStatus, GitError> {
+  let output = run_git_raw(&[
+    "-C",
+    path.to_str().ok_or(GitError::InvalidUtf8)?,
+    "status",
+    "-sb",
+  ])?;
+  let line = output
+    .lines()
+    .next()
+    .unwrap_or_default()
+    .trim()
+    .trim_start_matches("## ")
+    .trim();
+
+  let mut upstream: Option<String> = None;
+  let mut ahead: i64 = 0;
+  let mut behind: i64 = 0;
+
+  if let Some((_, tracking)) = line.split_once("...") {
+    let tracking = tracking.trim();
+    if !tracking.is_empty() {
+      let upstream_name = tracking
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(']')
+        .trim();
+      if !upstream_name.is_empty() {
+        upstream = Some(upstream_name.to_string());
+      }
+    }
+  }
+
+  if let Some(start) = line.find('[') {
+    let end = line.rfind(']').unwrap_or(line.len());
+    if start + 1 < end {
+      let inside = &line[start + 1..end];
+      let upstream_gone = inside.to_lowercase().contains("gone");
+      for entry in inside.split(',') {
+        let trimmed = entry.trim();
+        if let Some(count) = trimmed.strip_prefix("ahead ") {
+          let count_trimmed = count.trim();
+          if count_trimmed.is_empty() {
+            eprintln!("Warning: Failed to parse ahead count: empty");
+          } else {
+            match count_trimmed.parse::<i64>() {
+              Ok(parsed) => {
+                ahead = parsed;
+              }
+              Err(_) => {
+                eprintln!(
+                  "Warning: Failed to parse ahead count: {}",
+                  count_trimmed
+                );
+              }
+            }
+          }
+        } else if let Some(count) = trimmed.strip_prefix("behind ") {
+          let count_trimmed = count.trim();
+          if count_trimmed.is_empty() {
+            eprintln!("Warning: Failed to parse behind count: empty");
+          } else {
+            match count_trimmed.parse::<i64>() {
+              Ok(parsed) => {
+                behind = parsed;
+              }
+              Err(_) => {
+                eprintln!(
+                  "Warning: Failed to parse behind count: {}",
+                  count_trimmed
+                );
+              }
+            }
+          }
+        }
+      }
+      if upstream_gone {
+        upstream = None;
+        ahead = 0;
+        behind = 0;
+      }
+    }
+  }
+
+  Ok(BranchSyncStatus {
+    upstream,
+    ahead,
+    behind,
+  })
 }
 
 fn run_diff_with_base(
