@@ -2142,6 +2142,23 @@ export default function AppShell() {
     }
   };
 
+  const handleWindowDragKeyDown = async (
+    event: React.KeyboardEvent<HTMLDivElement>,
+  ) => {
+    if (!isTauriApp) {
+      return;
+    }
+    if (event.key !== 'Enter' && event.key !== ' ') {
+      return;
+    }
+    event.preventDefault();
+    try {
+      await getCurrentWindow().startDragging();
+    } catch (err) {
+      setError(`Failed to start dragging: ${String(err)}`);
+    }
+  };
+
   const handlePickLocalFolder = async () => {
     setAddError(null);
     try {
@@ -4666,6 +4683,10 @@ export default function AppShell() {
           <div
             data-tauri-drag-region
             onMouseDown={handleWindowDragStart}
+            onKeyDown={handleWindowDragKeyDown}
+            role="button"
+            tabIndex={0}
+            aria-label="Drag to move window"
             className="flex h-full flex-1 select-none items-center gap-3 px-4"
           >
             <div className="text-sm font-semibold">Supertree</div>
@@ -6950,7 +6971,10 @@ export default function AppShell() {
 
             {addRepoMode === 'local' ? (
               <div className="mt-4 space-y-3">
-                <label className="text-xs uppercase tracking-widest text-slate-500">
+                <label
+                  htmlFor="local-path-input"
+                  className="text-xs uppercase tracking-widest text-slate-500"
+                >
                   Local folder
                 </label>
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
@@ -6958,6 +6982,7 @@ export default function AppShell() {
                     Open local folder
                   </Button>
                   <input
+                    id="local-path-input"
                     value={localPath}
                     readOnly
                     placeholder="No folder selected"

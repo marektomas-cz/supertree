@@ -3,7 +3,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::SqlitePool;
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// SQLite connection wrapper for the Supertree app.
@@ -79,7 +80,14 @@ impl Database {
           db_path.display()
         );
         pool.close().await;
-        reset_dev_db(db_path)?;
+        let backup_path = reset_dev_db(db_path)?;
+        if let Some(path) = &backup_path {
+          eprintln!(
+            "[db] Dev database reset complete. Backup stored at {} (original {}).",
+            path.display(),
+            db_path.display()
+          );
+        }
         let pool = SqlitePool::connect_with(sqlite_options(db_path)).await?;
         sqlx::migrate!().run(&pool).await?;
         return Ok(Self { pool });
@@ -123,24 +131,33 @@ fn is_migration_version_mismatch(err: &sqlx::migrate::MigrateError) -> bool {
   matches!(err, sqlx::migrate::MigrateError::VersionMismatch { .. })
 }
 
-fn reset_dev_db(db_path: &Path) -> Result<(), DbError> {
+fn reset_dev_db(db_path: &Path) -> Result<Option<PathBuf>, DbError> {
   if !db_path.exists() {
-    return Ok(());
+    return Ok(None);
   }
   let file_name = db_path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
     DbError::InvalidPath("Database filename is not valid UTF-8".to_string())
   })?;
-  let timestamp = SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .unwrap_or_default()
-    .as_secs();
+  let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+    Ok(duration) => duration.as_secs().max(1),
+    Err(err) => {
+      eprintln!(
+        "[db] Failed to compute UNIX timestamp for DB backup: {err}. Falling back to process id."
+      );
+      u64::from(process::id()).max(1)
+    }
+  };
   let backup_path = db_path.with_file_name(format!("{file_name}.bak-{timestamp}"));
   fs::rename(db_path, &backup_path).map_err(|err| {
     DbError::InvalidPath(format!("Failed to backup dev database: {err}"))
   })?;
+  eprintln!(
+    "[db] Dev database backup created at {}.",
+    backup_path.display()
+  );
   let wal_path = db_path.with_file_name(format!("{file_name}-wal"));
   let shm_path = db_path.with_file_name(format!("{file_name}-shm"));
   let _ = fs::remove_file(wal_path);
   let _ = fs::remove_file(shm_path);
-  Ok(())
+  Ok(Some(backup_path))
 }
