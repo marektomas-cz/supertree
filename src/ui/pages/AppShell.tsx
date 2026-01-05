@@ -2161,6 +2161,10 @@ export default function AppShell() {
 
   const handlePickLocalFolder = async () => {
     setAddError(null);
+    if (!isTauriApp) {
+      setAddError('Folder picker is only available in the desktop app.');
+      return;
+    }
     try {
       const result = await open({
         directory: true,
