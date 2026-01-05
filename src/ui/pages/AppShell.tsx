@@ -2131,6 +2131,17 @@ export default function AppShell() {
     }
   };
 
+  const handleWindowDragStart = async (event: React.MouseEvent<HTMLDivElement>) => {
+    if (!isTauriApp || event.button !== 0) {
+      return;
+    }
+    try {
+      await getCurrentWindow().startDragging();
+    } catch (err) {
+      setError(`Failed to start dragging: ${String(err)}`);
+    }
+  };
+
   const handlePickLocalFolder = async () => {
     setAddError(null);
     try {
@@ -4654,7 +4665,8 @@ export default function AppShell() {
         <div className="flex h-11 items-center justify-between border-b border-slate-800 bg-slate-950/90">
           <div
             data-tauri-drag-region
-            className="flex h-full flex-1 items-center gap-3 px-4"
+            onMouseDown={handleWindowDragStart}
+            className="flex h-full flex-1 select-none items-center gap-3 px-4"
           >
             <div className="text-sm font-semibold">Supertree</div>
           </div>
