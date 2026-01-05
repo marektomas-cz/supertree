@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { open } from '@tauri-apps/plugin-dialog';
 import CommandPalette, { type CommandPaletteItem } from '@/components/CommandPalette';
 import FileOpener from '@/components/FileOpener';
 import TerminalPanel from '@/components/TerminalPanel';
@@ -576,7 +578,6 @@ export default function AppShell() {
   const [addRepoMode, setAddRepoMode] = useState<'local' | 'clone'>('local');
   const [localPath, setLocalPath] = useState('');
   const [cloneUrl, setCloneUrl] = useState('');
-  const [cloneDestination, setCloneDestination] = useState('');
   const [addState, setAddState] = useState<'idle' | 'adding' | 'error'>('idle');
   const [addError, setAddError] = useState<string | null>(null);
   const addRepoRef = useRef<HTMLDivElement>(null);
@@ -2093,6 +2094,61 @@ export default function AppShell() {
     };
   }, []);
 
+  const isTauriApp = typeof window !== 'undefined' && '__TAURI__' in window;
+
+  const handleWindowMinimize = async () => {
+    if (!isTauriApp) {
+      return;
+    }
+    try {
+      await getCurrentWindow().minimize();
+    } catch (err) {
+      setError(`Failed to minimize window: ${String(err)}`);
+    }
+  };
+
+  const handleWindowToggleMaximize = async () => {
+    if (!isTauriApp) {
+      return;
+    }
+    try {
+      await getCurrentWindow().toggleMaximize();
+    } catch (err) {
+      setError(`Failed to toggle maximize: ${String(err)}`);
+    }
+  };
+
+  const handleWindowClose = async () => {
+    if (!isTauriApp) {
+      return;
+    }
+    try {
+      await getCurrentWindow().close();
+    } catch (err) {
+      setError(`Failed to close window: ${String(err)}`);
+    }
+  };
+
+  const handlePickLocalFolder = async () => {
+    setAddError(null);
+    try {
+      const result = await open({
+        directory: true,
+        multiple: false,
+        title: 'Select repository folder',
+      });
+      if (!result) {
+        return;
+      }
+      const path = Array.isArray(result) ? result[0] : result;
+      if (path) {
+        setLocalPath(path);
+      }
+    } catch (err) {
+      setAddError(String(err));
+    }
+  };
+
   const handleAddRepo = async () => {
     setAddState('adding');
     setAddError(null);
@@ -2100,14 +2156,13 @@ export default function AppShell() {
       const payload =
         addRepoMode === 'local'
           ? { kind: 'local', path: localPath }
-          : { kind: 'clone', url: cloneUrl, destination: cloneDestination || undefined };
-      const repo = await invoke<RepoInfo>('addRepo', payload);
+          : { kind: 'clone', url: cloneUrl };
+      const repo = await invoke<RepoInfo>('addRepo', { payload });
       await loadRepos(repo.id);
       setActiveView('repo');
       setAddRepoOpen(false);
       setLocalPath('');
       setCloneUrl('');
-      setCloneDestination('');
       setAddState('idle');
     } catch (err) {
       setAddState('error');
@@ -4593,7 +4648,45 @@ export default function AppShell() {
   return (
     <TooltipProvider>
       <>
-      <div className="flex h-screen w-full bg-slate-950 text-slate-100">
+      <div className="flex h-screen w-full flex-col bg-slate-950 text-slate-100">
+        <div className="flex h-11 items-center justify-between border-b border-slate-800 bg-slate-950/90">
+          <div
+            data-tauri-drag-region
+            className="flex h-full flex-1 items-center gap-3 px-4"
+          >
+            <div className="text-sm font-semibold">Supertree</div>
+          </div>
+          <div className="flex items-center gap-1 px-2">
+            <button
+              type="button"
+              onClick={handleWindowMinimize}
+              className="flex h-8 w-10 items-center justify-center rounded-md text-slate-400 transition hover:bg-slate-900 hover:text-slate-100"
+              aria-label="Minimize"
+              title="Minimize"
+            >
+              —
+            </button>
+            <button
+              type="button"
+              onClick={handleWindowToggleMaximize}
+              className="flex h-8 w-10 items-center justify-center rounded-md text-slate-400 transition hover:bg-slate-900 hover:text-slate-100"
+              aria-label="Maximize"
+              title="Maximize"
+            >
+              □
+            </button>
+            <button
+              type="button"
+              onClick={handleWindowClose}
+              className="flex h-8 w-10 items-center justify-center rounded-md text-slate-400 transition hover:bg-red-500/20 hover:text-red-200"
+              aria-label="Close"
+              title="Close"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      <div className="flex min-h-0 flex-1">
       {showLeftSidebar ? (
         <>
           <aside
@@ -6842,17 +6935,21 @@ export default function AppShell() {
             </div>
 
             {addRepoMode === 'local' ? (
-              <div className="mt-4">
-                <label htmlFor="local-path" className="text-xs uppercase tracking-widest text-slate-500">
-                  Local path
+              <div className="mt-4 space-y-3">
+                <label className="text-xs uppercase tracking-widest text-slate-500">
+                  Local folder
                 </label>
-                <input
-                  id="local-path"
-                  value={localPath}
-                  onChange={(event) => setLocalPath(event.target.value)}
-                  placeholder="C:\\projects\\my-repo"
-                  className="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
-                />
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <Button variant="outline" onClick={handlePickLocalFolder}>
+                    Open local folder
+                  </Button>
+                  <input
+                    value={localPath}
+                    readOnly
+                    placeholder="No folder selected"
+                    className="flex-1 rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-300 placeholder:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+                  />
+                </div>
               </div>
             ) : (
               <div className="mt-4 space-y-4">
@@ -6865,21 +6962,6 @@ export default function AppShell() {
                     value={cloneUrl}
                     onChange={(event) => setCloneUrl(event.target.value)}
                     placeholder="https://github.com/org/repo.git"
-                    className="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
-                  />
-                </div>
-                <div>
-                  <label
-                    htmlFor="clone-destination"
-                    className="text-xs uppercase tracking-widest text-slate-500"
-                  >
-                    Destination (optional)
-                  </label>
-                  <input
-                    id="clone-destination"
-                    value={cloneDestination}
-                    onChange={(event) => setCloneDestination(event.target.value)}
-                    placeholder="C:\\repos\\clone-target"
                     className="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
                   />
                 </div>
@@ -6899,6 +6981,8 @@ export default function AppShell() {
           </div>
         </div>
       ) : null}
+      </div>
+      </div>
       </>
     </TooltipProvider>
   );

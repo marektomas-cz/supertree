@@ -2,8 +2,9 @@ use crate::paths::AppPaths;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::SqlitePool;
 use std::fmt;
+use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// SQLite connection wrapper for the Supertree app.
 #[derive(Debug, Clone)]
@@ -70,16 +71,21 @@ impl Database {
   /// Connect to the SQLite database using the resolved app paths.
   pub async fn connect(paths: &AppPaths) -> Result<Self, DbError> {
     let db_path = ensure_db_parent(&paths.db_path)?;
-    let options = SqliteConnectOptions::new()
-      .filename(db_path)
-      .create_if_missing(true)
-      .journal_mode(SqliteJournalMode::Wal)
-      .synchronous(SqliteSynchronous::Normal)
-      .foreign_keys(true)
-      .busy_timeout(Duration::from_secs(30));
-
-    let pool = SqlitePool::connect_with(options).await?;
-    sqlx::migrate!().run(&pool).await?;
+    let pool = SqlitePool::connect_with(sqlite_options(db_path)).await?;
+    if let Err(err) = sqlx::migrate!().run(&pool).await {
+      if cfg!(debug_assertions) && is_migration_version_mismatch(&err) {
+        eprintln!(
+          "[db] Migration checksum mismatch detected in debug. Resetting dev database at {}.",
+          db_path.display()
+        );
+        pool.close().await;
+        reset_dev_db(db_path)?;
+        let pool = SqlitePool::connect_with(sqlite_options(db_path)).await?;
+        sqlx::migrate!().run(&pool).await?;
+        return Ok(Self { pool });
+      }
+      return Err(err.into());
+    }
 
     Ok(Self { pool })
   }
@@ -101,4 +107,40 @@ fn ensure_db_parent(path: &Path) -> Result<&Path, DbError> {
     )));
   }
   Ok(path)
+}
+
+fn sqlite_options(path: &Path) -> SqliteConnectOptions {
+  SqliteConnectOptions::new()
+    .filename(path)
+    .create_if_missing(true)
+    .journal_mode(SqliteJournalMode::Wal)
+    .synchronous(SqliteSynchronous::Normal)
+    .foreign_keys(true)
+    .busy_timeout(Duration::from_secs(30))
+}
+
+fn is_migration_version_mismatch(err: &sqlx::migrate::MigrateError) -> bool {
+  matches!(err, sqlx::migrate::MigrateError::VersionMismatch { .. })
+}
+
+fn reset_dev_db(db_path: &Path) -> Result<(), DbError> {
+  if !db_path.exists() {
+    return Ok(());
+  }
+  let file_name = db_path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+    DbError::InvalidPath("Database filename is not valid UTF-8".to_string())
+  })?;
+  let timestamp = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_secs();
+  let backup_path = db_path.with_file_name(format!("{file_name}.bak-{timestamp}"));
+  fs::rename(db_path, &backup_path).map_err(|err| {
+    DbError::InvalidPath(format!("Failed to backup dev database: {err}"))
+  })?;
+  let wal_path = db_path.with_file_name(format!("{file_name}-wal"));
+  let shm_path = db_path.with_file_name(format!("{file_name}-shm"));
+  let _ = fs::remove_file(wal_path);
+  let _ = fs::remove_file(shm_path);
+  Ok(())
 }
