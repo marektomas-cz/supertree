@@ -137,6 +137,25 @@ type PullRequestCommentsResult = {
   newComments: boolean;
 };
 
+type BranchSyncStatus = {
+  upstream?: string | null;
+  ahead: number;
+  behind: number;
+};
+
+type ManualTodoItem = {
+  id: string;
+  text: string;
+  completed: boolean;
+};
+
+type AutoTodoItem = {
+  id: string;
+  label: string;
+  completed: boolean;
+  hint?: string;
+};
+
 type FileTreeNode = {
   name: string;
   path: string;
@@ -504,6 +523,36 @@ const renderMarkdownContent = (
   });
 };
 
+const EMPTY_TODOS: ManualTodoItem[] = [];
+
+const buildNotesContext = (notes: string) => {
+  const trimmed = notes.trim();
+  return `<notes>\n${trimmed || 'No notes yet.'}\n</notes>`;
+};
+
+const buildTodosContext = (
+  autoTodos: AutoTodoItem[],
+  manualTodos: ManualTodoItem[],
+) => {
+  const lines: string[] = ['Todos:'];
+  if (autoTodos.length > 0) {
+    lines.push('Auto:');
+    for (const todo of autoTodos) {
+      lines.push(`- [${todo.completed ? 'x' : ' '}] ${todo.label}`);
+    }
+  }
+  if (manualTodos.length > 0) {
+    lines.push('Manual:');
+    for (const todo of manualTodos) {
+      lines.push(`- [${todo.completed ? 'x' : ' '}] ${todo.text}`);
+    }
+  }
+  if (autoTodos.length === 0 && manualTodos.length === 0) {
+    lines.push('No todos yet.');
+  }
+  return lines.join('\n');
+};
+
 const RUN_OUTPUT_LIMIT = 400;
 
 /**
@@ -650,10 +699,53 @@ export default function AppShell() {
     useState<Record<string, string | null>>({});
   const [pullRequestActionLoadingByWorkspace, setPullRequestActionLoadingByWorkspace] =
     useState<Record<string, boolean>>({});
+  const [branchSyncByWorkspace, setBranchSyncByWorkspace] = useState<
+    Record<string, BranchSyncStatus | null>
+  >({});
+  const [branchSyncErrorByWorkspace, setBranchSyncErrorByWorkspace] = useState<
+    Record<string, string | null>
+  >({});
+  const [workspaceNotesByWorkspace, setWorkspaceNotesByWorkspace] = useState<
+    Record<string, string>
+  >({});
+  const [notesLoadedByWorkspace, setNotesLoadedByWorkspace] = useState<
+    Record<string, boolean>
+  >({});
+  const [notesErrorByWorkspace, setNotesErrorByWorkspace] = useState<
+    Record<string, string | null>
+  >({});
+  const [notesSaveStateByWorkspace, setNotesSaveStateByWorkspace] = useState<
+    Record<string, 'idle' | 'saving' | 'error'>
+  >({});
+  const notesSaveTimeoutRef = useRef<Record<string, number>>({});
+  const [workspaceTodosByWorkspace, setWorkspaceTodosByWorkspace] = useState<
+    Record<string, ManualTodoItem[]>
+  >({});
+  const [todosLoadedByWorkspace, setTodosLoadedByWorkspace] = useState<
+    Record<string, boolean>
+  >({});
+  const [todosErrorByWorkspace, setTodosErrorByWorkspace] = useState<
+    Record<string, string | null>
+  >({});
+  const [linkedWorkspaceErrorByWorkspace, setLinkedWorkspaceErrorByWorkspace] =
+    useState<Record<string, string | null>>({});
+  const [linkedWorkspaceLoadingByWorkspace, setLinkedWorkspaceLoadingByWorkspace] =
+    useState<Record<string, boolean>>({});
+  const [spotlightEnabled, setSpotlightEnabled] = useState(false);
+  const [spotlightActiveByWorkspace, setSpotlightActiveByWorkspace] = useState<
+    Record<string, boolean>
+  >({});
+  const [spotlightErrorByWorkspace, setSpotlightErrorByWorkspace] = useState<
+    Record<string, string | null>
+  >({});
+  const [spotlightLoadingByWorkspace, setSpotlightLoadingByWorkspace] = useState<
+    Record<string, boolean>
+  >({});
   const [reviewModel, setReviewModel] = useState<string | null>(null);
   const [reviewThinkingLevel, setReviewThinkingLevel] = useState<string | null>(
     null,
   );
+  const [newTodoText, setNewTodoText] = useState('');
   const [composerValue, setComposerValue] = useState('');
   const [composerDragActive, setComposerDragActive] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -694,7 +786,7 @@ export default function AppShell() {
     Record<string, string | null>
   >(() => readJson(STORAGE_KEYS.activeSessions, {}));
   const [activeTabByWorkspace, setActiveTabByWorkspace] = useState<
-    Record<string, 'changes' | 'session'>
+    Record<string, 'changes' | 'session' | 'notes'>
   >({});
   const [rightPanelTab, setRightPanelTab] = useState<'run' | 'terminal'>('run');
   const [gitPanelTab, setGitPanelTab] = useState<'changes' | 'files'>('changes');
@@ -944,6 +1036,14 @@ export default function AppShell() {
     }
     return repos.find((repo) => repo.id === activeWorkspace.repoId) ?? null;
   }, [activeWorkspace, repos]);
+  const linkableWorkspaces = useMemo(
+    () =>
+      workspaces.filter(
+        (workspace) =>
+          workspace.id !== activeWorkspaceId && workspace.state === 'active',
+      ),
+    [activeWorkspaceId, workspaces],
+  );
   const activeTargetBranch =
     activeWorkspace?.intendedTargetBranch ??
     activeRepo?.defaultBranch ??
@@ -962,6 +1062,57 @@ export default function AppShell() {
     : null;
   const activePullRequestActionLoading = activeWorkspaceId
     ? pullRequestActionLoadingByWorkspace[activeWorkspaceId] ?? false
+    : false;
+  const activeBranchSync = activeWorkspaceId
+    ? branchSyncByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const activeBranchSyncError = activeWorkspaceId
+    ? branchSyncErrorByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const activeNotes = activeWorkspaceId
+    ? workspaceNotesByWorkspace[activeWorkspaceId] ?? ''
+    : '';
+  const activeNotesError = activeWorkspaceId
+    ? notesErrorByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const activeNotesSaveState = activeWorkspaceId
+    ? notesSaveStateByWorkspace[activeWorkspaceId] ?? 'idle'
+    : 'idle';
+  const activeTodos = useMemo(() => {
+    if (!activeWorkspaceId) {
+      return EMPTY_TODOS;
+    }
+    return workspaceTodosByWorkspace[activeWorkspaceId] ?? EMPTY_TODOS;
+  }, [activeWorkspaceId, workspaceTodosByWorkspace]);
+  const activeTodosError = activeWorkspaceId
+    ? todosErrorByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const activeLinkedWorkspaceError = activeWorkspaceId
+    ? linkedWorkspaceErrorByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const activeLinkedWorkspaceLoading = activeWorkspaceId
+    ? linkedWorkspaceLoadingByWorkspace[activeWorkspaceId] ?? false
+    : false;
+  const activeSpotlightActive = activeWorkspaceId
+    ? spotlightActiveByWorkspace[activeWorkspaceId] ?? false
+    : false;
+  const activeSpotlightError = activeWorkspaceId
+    ? spotlightErrorByWorkspace[activeWorkspaceId] ?? null
+    : null;
+  const activeSpotlightLoading = activeWorkspaceId
+    ? spotlightLoadingByWorkspace[activeWorkspaceId] ?? false
+    : false;
+  const activeNotesLoaded = activeWorkspaceId
+    ? notesLoadedByWorkspace[activeWorkspaceId] ?? false
+    : false;
+  const activeTodosLoaded = activeWorkspaceId
+    ? todosLoadedByWorkspace[activeWorkspaceId] ?? false
+    : false;
+  const hasBranchSyncStatus = activeWorkspaceId
+    ? Object.prototype.hasOwnProperty.call(branchSyncByWorkspace, activeWorkspaceId)
+    : false;
+  const hasSpotlightStatus = activeWorkspaceId
+    ? Object.prototype.hasOwnProperty.call(spotlightActiveByWorkspace, activeWorkspaceId)
     : false;
   const activeRepoBranches = useMemo(
     () => (activeRepo ? repoBranchesByRepoId[activeRepo.id] ?? [] : []),
@@ -1014,6 +1165,64 @@ export default function AppShell() {
   const githubAvailable = githubAuthStatus?.available ?? false;
   const githubAuthenticated = githubAuthStatus?.authenticated ?? false;
   const githubReady = githubAvailable && githubAuthenticated;
+  const autoTodos = useMemo<AutoTodoItem[]>(() => {
+    const committed = activeGitStatus.length === 0;
+    const hasUpstream = Boolean(activeBranchSync?.upstream);
+    const pushed = hasUpstream ? activeBranchSync?.ahead === 0 : false;
+    const inSync = hasUpstream
+      ? activeBranchSync?.ahead === 0 && activeBranchSync?.behind === 0
+      : false;
+    const checksPassing = Boolean(
+      activePullRequestStatus &&
+        activePullRequestStatus.checks.total > 0 &&
+        activePullRequestStatus.checks.failed === 0 &&
+        activePullRequestStatus.checks.pending === 0,
+    );
+    return [
+      {
+        id: 'committed',
+        label: 'Changes committed',
+        completed: committed,
+      },
+      {
+        id: 'pushed',
+        label: 'Pushed to remote',
+        completed: pushed,
+        hint: hasUpstream ? undefined : 'No upstream configured.',
+      },
+      {
+        id: 'checks',
+        label: 'Checks passing',
+        completed: checksPassing,
+        hint: activePullRequestStatus ? undefined : 'No PR yet.',
+      },
+      {
+        id: 'sync',
+        label: 'In sync with remote',
+        completed: inSync,
+        hint: hasUpstream ? undefined : 'No upstream configured.',
+      },
+    ];
+  }, [activeBranchSync, activeGitStatus, activePullRequestStatus]);
+  const hasUncheckedTodos = useMemo(
+    () =>
+      autoTodos.some((todo) => !todo.completed) ||
+      activeTodos.some((todo) => !todo.completed),
+    [activeTodos, autoTodos],
+  );
+  const todosContext = useMemo(
+    () => buildTodosContext(autoTodos, activeTodos),
+    [activeTodos, autoTodos],
+  );
+  const notesContext = useMemo(() => buildNotesContext(activeNotes), [activeNotes]);
+  const isMergeable =
+    activePullRequestStatus?.mergeable?.toUpperCase() === 'MERGEABLE';
+  const canMerge =
+    Boolean(activeWorkspaceId) &&
+    githubReady &&
+    Boolean(activePullRequestStatus) &&
+    isMergeable &&
+    !hasUncheckedTodos;
   const visibleFileCount = Math.min(fileListVisibleCount, workspaceFiles.length);
   const fileListIsTruncated = workspaceFiles.length > visibleFileCount;
   const showLeftSidebar = leftSidebarVisible && !zenMode;
@@ -1352,12 +1561,85 @@ export default function AppShell() {
     [],
   );
 
+  const loadWorkspaceNotes = useCallback(async (workspaceId: string) => {
+    setNotesErrorByWorkspace((prev) => ({ ...prev, [workspaceId]: null }));
+    try {
+      const notes = await invoke<string>('getWorkspaceNotes', { workspaceId });
+      setWorkspaceNotesByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: notes ?? '',
+      }));
+      setNotesLoadedByWorkspace((prev) => ({ ...prev, [workspaceId]: true }));
+    } catch (err) {
+      setWorkspaceNotesByWorkspace((prev) => ({ ...prev, [workspaceId]: '' }));
+      setNotesErrorByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: String(err),
+      }));
+    }
+  }, []);
+
+  const loadWorkspaceTodos = useCallback(async (workspaceId: string) => {
+    setTodosErrorByWorkspace((prev) => ({ ...prev, [workspaceId]: null }));
+    try {
+      const items = await invoke<ManualTodoItem[]>('getWorkspaceTodos', {
+        workspaceId,
+      });
+      setWorkspaceTodosByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: items ?? [],
+      }));
+      setTodosLoadedByWorkspace((prev) => ({ ...prev, [workspaceId]: true }));
+    } catch (err) {
+      setWorkspaceTodosByWorkspace((prev) => ({ ...prev, [workspaceId]: [] }));
+      setTodosErrorByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: String(err),
+      }));
+    }
+  }, []);
+
+  const loadBranchSyncStatus = useCallback(async (workspaceId: string) => {
+    setBranchSyncErrorByWorkspace((prev) => ({ ...prev, [workspaceId]: null }));
+    try {
+      const status = await invoke<BranchSyncStatus>('getBranchSyncStatus', {
+        workspaceId,
+      });
+      setBranchSyncByWorkspace((prev) => ({ ...prev, [workspaceId]: status }));
+    } catch (err) {
+      setBranchSyncByWorkspace((prev) => ({ ...prev, [workspaceId]: null }));
+      setBranchSyncErrorByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: String(err),
+      }));
+    }
+  }, []);
+
+  const loadSpotlightStatus = useCallback(async (workspaceId: string) => {
+    setSpotlightErrorByWorkspace((prev) => ({ ...prev, [workspaceId]: null }));
+    try {
+      const active = await invoke<boolean>('getSpotlightStatus', {
+        workspaceId,
+      });
+      setSpotlightActiveByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: active,
+      }));
+    } catch (err) {
+      setSpotlightErrorByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: String(err),
+      }));
+    }
+  }, []);
+
   const loadReviewSettings = useCallback(async () => {
     try {
       const entries = await invoke<SettingsEntry[]>('listSettings');
-      const byKey = new Map(entries.map((entry) => [entry.key, entry.value]));  
+      const byKey = new Map(entries.map((entry) => [entry.key, entry.value]));
       setReviewModel(byKey.get('review_model') ?? null);
-      setReviewThinkingLevel(byKey.get('review_thinking_level') ?? null);       
+      setReviewThinkingLevel(byKey.get('review_thinking_level') ?? null);
+      setSpotlightEnabled(byKey.get('spotlight_enabled') === 'true');
     } catch (err) {
       console.warn('Failed to load review settings:', err);
     }
@@ -1448,7 +1730,95 @@ export default function AppShell() {
   }, [loadSessions]);
 
   useEffect(() => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    if (!activeNotesLoaded) {
+      void loadWorkspaceNotes(activeWorkspaceId);
+    }
+    if (!activeTodosLoaded) {
+      void loadWorkspaceTodos(activeWorkspaceId);
+    }
+    if (!hasBranchSyncStatus) {
+      void loadBranchSyncStatus(activeWorkspaceId);
+    }
+    if (spotlightEnabled && !hasSpotlightStatus) {
+      void loadSpotlightStatus(activeWorkspaceId);
+    }
+  }, [
+    activeWorkspaceId,
+    activeNotesLoaded,
+    activeTodosLoaded,
+    hasBranchSyncStatus,
+    hasSpotlightStatus,
+    loadBranchSyncStatus,
+    loadSpotlightStatus,
+    loadWorkspaceNotes,
+    loadWorkspaceTodos,
+    spotlightEnabled,
+  ]);
+
+  useEffect(() => {
+    if (spotlightEnabled) {
+      return;
+    }
+    const activeIds = Object.entries(spotlightActiveByWorkspace)
+      .filter(([, active]) => active)
+      .map(([id]) => id);
+    if (activeIds.length === 0) {
+      return;
+    }
+    activeIds.forEach((workspaceId) => {
+      setSpotlightLoadingByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: true,
+      }));
+      setSpotlightErrorByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: null,
+      }));
+      invoke('disableSpotlight', { workspaceId })
+        .then(() => {
+          setSpotlightActiveByWorkspace((prev) => ({
+            ...prev,
+            [workspaceId]: false,
+          }));
+        })
+        .catch((err) => {
+          setSpotlightErrorByWorkspace((prev) => ({
+            ...prev,
+            [workspaceId]: String(err),
+          }));
+        })
+        .finally(() => {
+          setSpotlightLoadingByWorkspace((prev) => ({
+            ...prev,
+            [workspaceId]: false,
+          }));
+        });
+    });
+  }, [spotlightActiveByWorkspace, spotlightEnabled]);
+
+  useEffect(() => {
     void loadReviewSettings();
+  }, [loadReviewSettings]);
+
+  useEffect(() => {
+    const timeoutMap = notesSaveTimeoutRef.current;
+    return () => {
+      const timeouts = Object.values(timeoutMap);
+      timeouts.forEach((timeoutId) => window.clearTimeout(timeoutId));
+    };
+  }, []);
+
+  useEffect(() => {
+    const handler = () => {
+      void loadReviewSettings();
+    };
+    window.addEventListener('supertree-settings-updated', handler);
+    return () => {
+      window.removeEventListener('supertree-settings-updated', handler);
+    };
   }, [loadReviewSettings]);
 
   useEffect(() => {
@@ -2082,8 +2452,8 @@ export default function AppShell() {
       return;
     }
     setActiveView('workspace');
-    const prompt = composerValue.trim();
-    if (!prompt) {
+    const rawPrompt = composerValue.trim();
+    if (!rawPrompt) {
       return;
     }
     if (activeSessionStatus === 'running') {
@@ -2108,6 +2478,14 @@ export default function AppShell() {
         : undefined;
     const draftAttachments = draftAttachmentsBySession[session.id] ?? [];
     const attachmentIds = draftAttachments.map((item) => item.id);
+    let prompt = rawPrompt;
+    if (rawPrompt.includes('@todos')) {
+      prompt = prompt.replaceAll('@todos', todosContext);
+    }
+    if (rawPrompt.includes('<notes>')) {
+      prompt = prompt.replaceAll('<notes>', notesContext);
+    }
+
     try {
       setSessionErrors((prev) => ({ ...prev, [session.id]: null }));
       const userMessage = await invoke<SessionMessageRecord>('sendSessionMessage', {
@@ -2150,8 +2528,10 @@ export default function AppShell() {
     createSessionForWorkspace,
     draftAttachmentsBySession,
     loadSessionAttachments,
+    notesContext,
     pendingIssueId,
     permissionModeBySession,
+    todosContext,
   ]);
 
   const handleReviewChanges = useCallback(async () => {
@@ -2334,6 +2714,34 @@ export default function AppShell() {
     loadPullRequestStatus,
     loadWorkspaces,
   ]);
+
+  const handleMergePullRequest = useCallback(async () => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    setPullRequestActionErrorByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: null,
+    }));
+    setPullRequestActionLoadingByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: true,
+    }));
+    try {
+      await invoke('mergePullRequest', { workspaceId: activeWorkspaceId });
+      await loadPullRequestStatus(activeWorkspaceId, true);
+    } catch (err) {
+      setPullRequestActionErrorByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: String(err),
+      }));
+    } finally {
+      setPullRequestActionLoadingByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: false,
+      }));
+    }
+  }, [activeWorkspaceId, loadPullRequestStatus]);
 
   const handleSetTargetBranch = useCallback(
     async (branch: string) => {
@@ -3126,6 +3534,13 @@ export default function AppShell() {
     if (!hasGitStatus) {
       loadGitStatus(activeWorkspaceId);
     }
+    const hasBranchSync = Object.prototype.hasOwnProperty.call(
+      branchSyncByWorkspace,
+      activeWorkspaceId,
+    );
+    if (!hasBranchSync) {
+      loadBranchSyncStatus(activeWorkspaceId);
+    }
     const hasWorkspaceDiff = Object.prototype.hasOwnProperty.call(
       workspaceDiffByWorkspace,
       activeWorkspaceId,
@@ -3135,7 +3550,9 @@ export default function AppShell() {
     }
   }, [
     activeWorkspaceId,
+    branchSyncByWorkspace,
     gitStatusByWorkspace,
+    loadBranchSyncStatus,
     loadGitStatus,
     loadWorkspaceDiff,
     workspaceDiffByWorkspace,
@@ -3181,6 +3598,10 @@ export default function AppShell() {
 
   useEffect(() => {
     setFileListVisibleCount(20);
+  }, [activeWorkspaceId]);
+
+  useEffect(() => {
+    setNewTodoText('');
   }, [activeWorkspaceId]);
 
   const handleOpenFile = useCallback(
@@ -3229,17 +3650,209 @@ export default function AppShell() {
     void loadWorkspaceDiff(activeWorkspaceId, null);
   }, [activeWorkspaceId, loadWorkspaceDiff]);
 
+  const handleNotesChange = useCallback(
+    (value: string) => {
+      if (!activeWorkspaceId) {
+        return;
+      }
+      setWorkspaceNotesByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: value,
+      }));
+      setNotesLoadedByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: true,
+      }));
+      setNotesSaveStateByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: 'saving',
+      }));
+      setNotesErrorByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: null,
+      }));
+      const existing = notesSaveTimeoutRef.current[activeWorkspaceId];
+      if (existing) {
+        window.clearTimeout(existing);
+      }
+      notesSaveTimeoutRef.current[activeWorkspaceId] = window.setTimeout(() => {
+        invoke('setWorkspaceNotes', {
+          workspaceId: activeWorkspaceId,
+          content: value,
+        })
+          .then(() => {
+            setNotesSaveStateByWorkspace((prev) => ({
+              ...prev,
+              [activeWorkspaceId]: 'idle',
+            }));
+          })
+          .catch((err) => {
+            setNotesSaveStateByWorkspace((prev) => ({
+              ...prev,
+              [activeWorkspaceId]: 'error',
+            }));
+            setNotesErrorByWorkspace((prev) => ({
+              ...prev,
+              [activeWorkspaceId]: String(err),
+            }));
+          });
+      }, 600);
+    },
+    [activeWorkspaceId],
+  );
+
+  const persistTodos = useCallback(async (workspaceId: string, items: ManualTodoItem[]) => {
+    setTodosErrorByWorkspace((prev) => ({ ...prev, [workspaceId]: null }));
+    setWorkspaceTodosByWorkspace((prev) => ({ ...prev, [workspaceId]: items }));
+    try {
+      await invoke('setWorkspaceTodos', { workspaceId, items });
+    } catch (err) {
+      setTodosErrorByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: String(err),
+      }));
+    }
+  }, []);
+
+  const handleAddTodo = useCallback(async () => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    const trimmed = newTodoText.trim();
+    if (!trimmed) {
+      return;
+    }
+    const next: ManualTodoItem[] = [
+      ...activeTodos,
+      {
+        id: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
+        text: trimmed,
+        completed: false,
+      },
+    ];
+    setNewTodoText('');
+    await persistTodos(activeWorkspaceId, next);
+  }, [activeTodos, activeWorkspaceId, newTodoText, persistTodos]);
+
+  const handleToggleTodo = useCallback(
+    async (todoId: string) => {
+      if (!activeWorkspaceId) {
+        return;
+      }
+      const next = activeTodos.map((item) =>
+        item.id === todoId ? { ...item, completed: !item.completed } : item,
+      );
+      await persistTodos(activeWorkspaceId, next);
+    },
+    [activeTodos, activeWorkspaceId, persistTodos],
+  );
+
+  const handleDeleteTodo = useCallback(
+    async (todoId: string) => {
+      if (!activeWorkspaceId) {
+        return;
+      }
+      const next = activeTodos.filter((item) => item.id !== todoId);
+      await persistTodos(activeWorkspaceId, next);
+    },
+    [activeTodos, activeWorkspaceId, persistTodos],
+  );
+
+  const handleToggleSpotlight = useCallback(async () => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    setSpotlightErrorByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: null,
+    }));
+    setSpotlightLoadingByWorkspace((prev) => ({
+      ...prev,
+      [activeWorkspaceId]: true,
+    }));
+    try {
+      if (activeSpotlightActive) {
+        await invoke('disableSpotlight', { workspaceId: activeWorkspaceId });
+      } else {
+        await invoke('enableSpotlight', { workspaceId: activeWorkspaceId });
+      }
+      setSpotlightActiveByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: !activeSpotlightActive,
+      }));
+    } catch (err) {
+      setSpotlightErrorByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: String(err),
+      }));
+    } finally {
+      setSpotlightLoadingByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: false,
+      }));
+    }
+  }, [activeSpotlightActive, activeWorkspaceId]);
+
+  const handleToggleLinkedWorkspace = useCallback(
+    async (targetId: string, enabled: boolean) => {
+      if (!activeWorkspaceId) {
+        return;
+      }
+      const current = new Set(activeWorkspace?.linkedWorkspaceIds ?? []);
+      if (enabled) {
+        current.add(targetId);
+      } else {
+        current.delete(targetId);
+      }
+      const next = Array.from(current);
+      setLinkedWorkspaceErrorByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: null,
+      }));
+      setLinkedWorkspaceLoadingByWorkspace((prev) => ({
+        ...prev,
+        [activeWorkspaceId]: true,
+      }));
+      try {
+        await invoke('setWorkspaceLinkedWorkspaces', {
+          workspaceId: activeWorkspaceId,
+          linkedWorkspaceIds: next,
+        });
+        setWorkspaces((prev) =>
+          prev.map((workspace) =>
+            workspace.id === activeWorkspaceId
+              ? { ...workspace, linkedWorkspaceIds: next }
+              : workspace,
+          ),
+        );
+      } catch (err) {
+        setLinkedWorkspaceErrorByWorkspace((prev) => ({
+          ...prev,
+          [activeWorkspaceId]: String(err),
+        }));
+      } finally {
+        setLinkedWorkspaceLoadingByWorkspace((prev) => ({
+          ...prev,
+          [activeWorkspaceId]: false,
+        }));
+      }
+    },
+    [activeWorkspace, activeWorkspaceId],
+  );
+
   const handleRefreshGitPanel = useCallback(() => {
     if (!activeWorkspaceId) {
       return;
     }
     loadGitStatus(activeWorkspaceId);
+    loadBranchSyncStatus(activeWorkspaceId);
     const selected = selectedDiffPathByWorkspace[activeWorkspaceId] ?? null;
     loadWorkspaceDiff(activeWorkspaceId, selected);
     void loadPullRequestStatus(activeWorkspaceId, true);
     void loadGithubAuthStatus();
   }, [
     activeWorkspaceId,
+    loadBranchSyncStatus,
     loadGitStatus,
     loadGithubAuthStatus,
     loadPullRequestStatus,
@@ -4209,6 +4822,29 @@ export default function AppShell() {
               >
                 All changes
               </button>
+              <button
+                type="button"
+                disabled={!activeWorkspaceId}
+                onClick={() => {
+                  if (!activeWorkspaceId) {
+                    return;
+                  }
+                  setActiveView('workspace');
+                  setActiveTabByWorkspace((prev) => ({
+                    ...prev,
+                    [activeWorkspaceId]: 'notes',
+                  }));
+                }}
+                className={`rounded-md px-3 py-1.5 text-sm transition ${
+                  !activeWorkspaceId
+                    ? 'cursor-not-allowed text-slate-600'
+                    : activeTab === 'notes'
+                      ? 'bg-slate-800 text-slate-100'
+                      : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                }`}
+              >
+                Notes
+              </button>
               {activeSessions.map((session) => {
                 const isActive =
                   activeTab === 'session' && activeSessionId === session.id;
@@ -4344,6 +4980,11 @@ export default function AppShell() {
               {activeGitStatusError}
             </div>
           ) : null}
+          {activeBranchSyncError ? (
+            <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+              {activeBranchSyncError}
+            </div>
+          ) : null}
           {activeWorkspaceDiffError ? (
             <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
               {activeWorkspaceDiffError}
@@ -4388,10 +5029,26 @@ export default function AppShell() {
                       </div>
                     ) : null}
                   </div>
-                  <div className="text-xs text-slate-500">
-                    {workspaceFiles.length} files
+                  <div className="flex items-center gap-3 text-xs text-slate-500">
+                    <span>{workspaceFiles.length} files</span>
+                    {spotlightEnabled ? (
+                      <Button
+                        size="sm"
+                        variant={activeSpotlightActive ? 'default' : 'outline'}
+                        disabled={!activeWorkspaceId || activeSpotlightLoading}
+                        onClick={handleToggleSpotlight}
+                      >
+                        {activeSpotlightActive ? 'Spotlight on' : 'Spotlight'}
+                      </Button>
+                    ) : null}
                   </div>
                 </div>
+
+                {activeSpotlightError ? (
+                  <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                    {activeSpotlightError}
+                  </div>
+                ) : null}
 
                 {activeTab === 'changes' ? (
                   <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)_minmax(0,1fr)]">
@@ -4493,6 +5150,228 @@ export default function AppShell() {
                             Use {isMac ? 'Cmd+P' : 'Ctrl+P'} to open a file.
                           </div>
                         )}
+                      </div>
+                    </div>
+                  </div>
+                ) : activeTab === 'notes' ? (
+                  <div className="space-y-6">
+                    {activeNotesError ? (
+                      <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                        {activeNotesError}
+                      </div>
+                    ) : null}
+                    {activeTodosError ? (
+                      <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                        {activeTodosError}
+                      </div>
+                    ) : null}
+                    {activeLinkedWorkspaceError ? (
+                      <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                        {activeLinkedWorkspaceError}
+                      </div>
+                    ) : null}
+                    <div className="grid gap-6 lg:grid-cols-2">
+                      <div className="rounded-lg border border-slate-800 bg-slate-950/60">
+                        <div className="border-b border-slate-800 px-4 py-3">
+                          <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                            Notes
+                          </div>
+                          <div className="mt-1 text-xs text-slate-500">
+                            {activeNotesSaveState === 'saving'
+                              ? 'Saving...'
+                              : activeNotesSaveState === 'error'
+                                ? 'Save failed'
+                                : 'Saved'}
+                          </div>
+                          <div className="mt-1 text-[11px] text-slate-500">
+                            Include in prompts with{' '}
+                            <span className="text-slate-300">{'<notes>'}</span>.
+                          </div>
+                        </div>
+                        <div className="p-4">
+                          <textarea
+                            value={activeNotes}
+                            onChange={(event) => handleNotesChange(event.target.value)}
+                            placeholder="Write workspace notes..."
+                            className="h-64 w-full resize-none rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500"
+                          />
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-slate-800 bg-slate-950/60">
+                        <div className="border-b border-slate-800 px-4 py-3">
+                          <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                            Preview
+                          </div>
+                        </div>
+                        <div className="max-h-[360px] overflow-auto px-4 py-3">
+                          {activeNotes.trim() ? (
+                            <div className="space-y-2">
+                              {renderMarkdownContent(
+                                activeNotes,
+                                workspaceFileSet,
+                                (path) => {
+                                  if (activeWorkspaceId) {
+                                    void handleOpenFile(activeWorkspaceId, path);
+                                  }
+                                },
+                              )}
+                            </div>
+                          ) : (
+                            <div className="text-sm text-slate-500">
+                              No notes yet.
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="grid gap-6 lg:grid-cols-2">
+                      <div className="rounded-lg border border-slate-800 bg-slate-950/60">
+                        <div className="border-b border-slate-800 px-4 py-3">
+                          <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                            Todos
+                          </div>
+                          <div className="mt-1 text-xs text-slate-500">
+                            {hasUncheckedTodos ? 'Incomplete' : 'All done'}
+                          </div>
+                          <div className="mt-1 text-[11px] text-slate-500">
+                            Include in prompts with{' '}
+                            <span className="text-slate-300">@todos</span>.
+                          </div>
+                        </div>
+                        <div className="space-y-4 px-4 py-3 text-sm text-slate-200">
+                          <div>
+                            <div className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
+                              Auto
+                            </div>
+                            <div className="mt-2 space-y-2">
+                              {autoTodos.map((todo) => (
+                                <label
+                                  key={todo.id}
+                                  className="flex items-center justify-between gap-2 rounded-md border border-slate-800 px-3 py-2 text-xs text-slate-300"
+                                >
+                                  <span className="flex items-center gap-2">
+                                    <input
+                                      type="checkbox"
+                                      checked={todo.completed}
+                                      disabled
+                                      className="h-4 w-4 rounded border-slate-700 bg-slate-950"
+                                    />
+                                    {todo.label}
+                                  </span>
+                                  {todo.hint ? (
+                                    <span className="text-[10px] uppercase tracking-widest text-slate-500">
+                                      {todo.hint}
+                                    </span>
+                                  ) : null}
+                                </label>
+                              ))}
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
+                              Manual
+                            </div>
+                            {activeTodos.length > 0 ? (
+                              <div className="mt-2 space-y-2">
+                                {activeTodos.map((todo) => (
+                                  <div
+                                    key={todo.id}
+                                    className="flex items-center justify-between gap-2 rounded-md border border-slate-800 px-3 py-2 text-xs text-slate-300"
+                                  >
+                                    <label className="flex items-center gap-2">
+                                      <input
+                                        type="checkbox"
+                                        checked={todo.completed}
+                                        onChange={() => handleToggleTodo(todo.id)}
+                                        className="h-4 w-4 rounded border-slate-700 bg-slate-950"
+                                      />
+                                      {todo.text}
+                                    </label>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteTodo(todo.id)}
+                                      className="text-slate-500 transition hover:text-slate-200"
+                                    >
+                                      ✕
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="mt-2 text-xs text-slate-500">
+                                No manual todos yet.
+                              </div>
+                            )}
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              <input
+                                value={newTodoText}
+                                onChange={(event) => setNewTodoText(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Enter') {
+                                    event.preventDefault();
+                                    void handleAddTodo();
+                                  }
+                                }}
+                                placeholder="Add a todo..."
+                                className="min-w-[200px] flex-1 rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500"
+                              />
+                              <Button
+                                size="sm"
+                                onClick={handleAddTodo}
+                                disabled={!newTodoText.trim()}
+                              >
+                                Add
+                              </Button>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-slate-800 bg-slate-950/60">
+                        <div className="border-b border-slate-800 px-4 py-3">
+                          <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                            Linked workspaces
+                          </div>
+                          <div className="mt-1 text-xs text-slate-500">
+                            {linkableWorkspaces.length} available
+                          </div>
+                        </div>
+                        <div className="space-y-2 px-4 py-3 text-sm text-slate-300">
+                          {linkableWorkspaces.length === 0 ? (
+                            <div className="text-xs text-slate-500">
+                              No other active workspaces to link.
+                            </div>
+                          ) : (
+                            linkableWorkspaces.map((workspace) => {
+                              const repoName =
+                                repos.find((repo) => repo.id === workspace.repoId)?.name ??
+                                'Repo';
+                              const linkedIds = activeWorkspace?.linkedWorkspaceIds ?? [];
+                              const isLinked = linkedIds.includes(workspace.id);
+                              return (
+                                <label
+                                  key={workspace.id}
+                                  className="flex items-center justify-between gap-2 rounded-md border border-slate-800 px-3 py-2 text-xs"
+                                >
+                                  <span>
+                                    {repoName} · {workspace.branch}
+                                  </span>
+                                  <input
+                                    type="checkbox"
+                                    checked={isLinked}
+                                    disabled={activeLinkedWorkspaceLoading}
+                                    onChange={(event) =>
+                                      handleToggleLinkedWorkspace(
+                                        workspace.id,
+                                        event.target.checked,
+                                      )
+                                    }
+                                    className="h-4 w-4 rounded border-slate-700 bg-slate-950"
+                                  />
+                                </label>
+                              );
+                            })
+                          )}
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -5029,6 +5908,21 @@ export default function AppShell() {
                   onClick={handleReviewChanges}
                 >
                   Review
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={
+                    !canMerge || activePullRequestActionLoading
+                  }
+                  onClick={handleMergePullRequest}
+                  title={
+                    hasUncheckedTodos
+                      ? 'Complete all todos before merging.'
+                      : undefined
+                  }
+                >
+                  Merge
                 </Button>
                 <Button
                   size="sm"

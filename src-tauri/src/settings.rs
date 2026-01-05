@@ -14,6 +14,8 @@ pub const KEY_CLAUDE_PERMISSION_MODE: &str = "claude_permission_mode";
 pub const KEY_ENV_VARS: &str = "env_vars";
 /// Settings key for optional workspaces root override.
 pub const KEY_WORKSPACES_ROOT: &str = "workspaces_root";
+/// Settings key for spotlight feature enablement.
+pub const KEY_SPOTLIGHT_ENABLED: &str = "spotlight_enabled";
 
 const DEFAULT_SETTINGS: &[(&str, &str)] = &[
   (KEY_DEFAULT_MODEL, "gpt-5-codex"),
@@ -22,6 +24,7 @@ const DEFAULT_SETTINGS: &[(&str, &str)] = &[
   (KEY_CLAUDE_PERMISSION_MODE, "default"),
   (KEY_ENV_VARS, ""),
   (KEY_WORKSPACES_ROOT, ""),
+  (KEY_SPOTLIGHT_ENABLED, "false"),
 ];
 
 /// Stored settings entry.

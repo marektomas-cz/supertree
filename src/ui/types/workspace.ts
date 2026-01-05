@@ -14,6 +14,7 @@ export type WorkspaceInfo = {
   prNumber?: number | null;
   prUrl?: string | null;
   prLastCommentId?: string | null;
+  linkedWorkspaceIds?: string[] | null;
 };
 
 export type FilePreview = {
