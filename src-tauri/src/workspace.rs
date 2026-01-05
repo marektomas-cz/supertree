@@ -372,12 +372,32 @@ pub async fn set_workspace_linked_workspace_ids(
   workspace_id: &str,
   linked_ids_json: Option<&str>,
 ) -> Result<(), DbError> {
+  let normalized_ids_json = match linked_ids_json {
+    None => None,
+    Some(raw) => {
+      let trimmed = raw.trim();
+      if trimmed.is_empty() {
+        return Err(DbError::Parse(
+          "Linked workspace ids JSON is empty".to_string(),
+        ));
+      }
+      let parsed: Vec<String> = serde_json::from_str(trimmed).map_err(|err| {
+        DbError::Parse(format!("Invalid linked workspace ids JSON: {err}"))
+      })?;
+      let normalized = serde_json::to_string(&parsed).map_err(|err| {
+        DbError::Parse(format!(
+          "Failed to serialize linked workspace ids JSON: {err}"
+        ))
+      })?;
+      Some(normalized)
+    }
+  };
   let result = sqlx::query(
     "UPDATE workspaces
      SET linked_workspace_ids = ?, updated_at = CURRENT_TIMESTAMP
      WHERE id = ?",
   )
-  .bind(linked_ids_json)
+  .bind(normalized_ids_json.as_deref())
   .bind(workspace_id)
   .execute(pool)
   .await?;

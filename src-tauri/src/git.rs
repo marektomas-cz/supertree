@@ -398,17 +398,39 @@ pub fn branch_sync_status(path: &Path) -> Result<BranchSyncStatus, GitError> {
       for entry in inside.split(',') {
         let trimmed = entry.trim();
         if let Some(count) = trimmed.strip_prefix("ahead ") {
-          let parsed = count.trim().parse::<i64>().unwrap_or(0);
-          if parsed == 0 && !count.trim().is_empty() {
-            eprintln!("Warning: Failed to parse ahead count: {}", count.trim());
+          let count_trimmed = count.trim();
+          if count_trimmed.is_empty() {
+            eprintln!("Warning: Failed to parse ahead count: empty");
+          } else {
+            match count_trimmed.parse::<i64>() {
+              Ok(parsed) => {
+                ahead = parsed;
+              }
+              Err(_) => {
+                eprintln!(
+                  "Warning: Failed to parse ahead count: {}",
+                  count_trimmed
+                );
+              }
+            }
           }
-          ahead = parsed;
         } else if let Some(count) = trimmed.strip_prefix("behind ") {
-          let parsed = count.trim().parse::<i64>().unwrap_or(0);
-          if parsed == 0 && !count.trim().is_empty() {
-            eprintln!("Warning: Failed to parse behind count: {}", count.trim());
+          let count_trimmed = count.trim();
+          if count_trimmed.is_empty() {
+            eprintln!("Warning: Failed to parse behind count: empty");
+          } else {
+            match count_trimmed.parse::<i64>() {
+              Ok(parsed) => {
+                behind = parsed;
+              }
+              Err(_) => {
+                eprintln!(
+                  "Warning: Failed to parse behind count: {}",
+                  count_trimmed
+                );
+              }
+            }
           }
-          behind = parsed;
         }
       }
       if upstream_gone {
