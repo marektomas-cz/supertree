@@ -3155,6 +3155,7 @@ fn main() {
       app.manage(SpotlightManager::default());
       Ok(())
     })
+    .plugin(tauri_plugin_dialog::init())
     .on_window_event(|window, event| {
       if let tauri::WindowEvent::CloseRequested { .. } = event {
         let sidecar = window.app_handle().state::<SidecarManager>().inner().clone();
