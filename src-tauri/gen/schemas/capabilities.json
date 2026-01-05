@@ -1,1 +1,1 @@
-{}
+{"main":{"identifier":"main","description":"Main window permissions for Supertree.","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-minimize","core:window:allow-toggle-maximize","core:window:allow-close","dialog:allow-open"]}}
