@@ -79,6 +79,7 @@ impl Database {
       .busy_timeout(Duration::from_secs(30));
 
     let pool = SqlitePool::connect_with(options).await?;
+    bootstrap_schema(&pool).await?;
     sqlx::migrate!().run(&pool).await?;
 
     Ok(Self { pool })
@@ -88,6 +89,51 @@ impl Database {
   pub fn pool(&self) -> &SqlitePool {
     &self.pool
   }
+}
+
+async fn bootstrap_schema(pool: &SqlitePool) -> Result<(), DbError> {
+  sqlx::query(
+    "CREATE TABLE IF NOT EXISTS repos (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      root_path TEXT NOT NULL,
+      remote_url TEXT,
+      default_branch TEXT,
+      scripts_setup TEXT,
+      scripts_run TEXT,
+      scripts_archive TEXT,
+      run_script_mode TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )",
+  )
+  .execute(pool)
+  .await?;
+  sqlx::query(
+    "CREATE TABLE IF NOT EXISTS workspaces (
+      id TEXT PRIMARY KEY,
+      repo_id TEXT NOT NULL,
+      branch TEXT NOT NULL,
+      directory_name TEXT,
+      path TEXT NOT NULL,
+      state TEXT NOT NULL,
+      pinned_at TEXT,
+      unread INTEGER NOT NULL DEFAULT 0,
+      initialization_log_path TEXT,
+      setup_log_path TEXT,
+      initialization_files_copied INTEGER,
+      intended_target_branch TEXT,
+      placeholder_branch_name TEXT,
+      linked_workspace_ids TEXT,
+      big_terminal_mode INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    )",
+  )
+  .execute(pool)
+  .await?;
+  Ok(())
 }
 
 fn ensure_db_parent(path: &Path) -> Result<&Path, DbError> {
