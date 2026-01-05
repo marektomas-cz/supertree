@@ -735,18 +735,19 @@ async fn handle_sidecar_message(
     Some(id) => (id, false),
     None => {
       let new_id = sessions::generate_message_id(db.pool()).await.map_err(|err| err.to_string())?;
-      sessions::insert_session_message(
-        db.pool(),
-        sessions::NewSessionMessage {
-          id: new_id.clone(),
-          session_id: payload.id.clone(),
-          turn_id,
-          role: "assistant".to_string(),
-          content: content.clone(),
-          metadata_json: Some(metadata_str.clone()),
-        },
-      )
-      .await
+        sessions::insert_session_message(
+          db.pool(),
+          sessions::NewSessionMessage {
+            id: new_id.clone(),
+            session_id: payload.id.clone(),
+            turn_id,
+            role: "assistant".to_string(),
+            content: content.clone(),
+            metadata_json: Some(metadata_str.clone()),
+            checkpoint_id: None,
+          },
+        )
+        .await
       .map_err(|err| err.to_string())?;
       stream_state.assistant_message_id = Some(new_id.clone());
       (new_id, true)
@@ -809,6 +810,7 @@ async fn handle_sidecar_error(
       role: "system".to_string(),
       content: payload.error.clone(),
       metadata_json: Some(metadata.to_string()),
+      checkpoint_id: None,
     },
   )
   .await

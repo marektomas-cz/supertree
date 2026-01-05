@@ -2,6 +2,7 @@
 
 mod db;
 mod git;
+mod checkpoints;
 mod attachments;
 mod path_utils;
 mod paths;
@@ -32,6 +33,12 @@ use libc;
 
 use crate::db::{Database, DbError};
 use crate::attachments::AttachmentRecord;
+use crate::checkpoints::{
+  create_checkpoint,
+  delete_checkpoint,
+  restore_checkpoint,
+  CheckpointOutcome,
+};
 use crate::git::{
   branch_exists, clone_repo, create_worktree, diff as git_diff, inspect_repo, is_git_repo,
   list_branches, list_status, read_supertree_config, remove_worktree, repo_name_from_url,
@@ -221,6 +228,13 @@ struct SendSessionMessageRequest {
   prompt: String,
   permission_mode: Option<String>,
   attachment_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetSessionToTurnRequest {
+  session_id: String,
+  turn_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -892,14 +906,43 @@ async fn sendSessionMessage(
     .await
     .map_err(|err| err.to_string())?;
 
-  let user_message = sessions::insert_session_message_with_next_turn(
+  let next_turn_id = sessions::next_turn_id(db.pool(), &session.id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let checkpoint_id = if session.agent_type == "claude" {
+    let checkpoint_id = format!("session-{}-turn-{}-user", session.id, next_turn_id);
+    let workspace_path = PathBuf::from(&workspace_record.path);
+    match create_checkpoint(&workspace_path, &checkpoint_id) {
+      Ok(CheckpointOutcome::Created) => Some(checkpoint_id),
+      Ok(CheckpointOutcome::Skipped { reason }) => {
+        eprintln!(
+          "[checkpoint] skipped for session {} turn {}: {}",
+          session.id, next_turn_id, reason
+        );
+        None
+      }
+      Err(err) => {
+        eprintln!(
+          "[checkpoint] failed for session {} turn {}: {}",
+          session.id, next_turn_id, err
+        );
+        None
+      }
+    }
+  } else {
+    None
+  };
+
+  let user_message = sessions::insert_session_message(
     db.pool(),
-    sessions::NewSessionMessageDraft {
+    sessions::NewSessionMessage {
       id: message_id,
       session_id: session.id.clone(),
+      turn_id: next_turn_id,
       role: "user".to_string(),
       content: prompt.to_string(),
       metadata_json: None,
+      checkpoint_id,
     },
   )
   .await
@@ -1017,6 +1060,149 @@ async fn cancelSession(
   sessions::set_session_status(db.pool(), &session.id, "idle")
     .await
     .map_err(|err| err.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+async fn resetSessionToTurn(
+  db: tauri::State<'_, Database>,
+  sidecar: tauri::State<'_, SidecarManager>,
+  payload: ResetSessionToTurnRequest,
+) -> Result<(), String> {
+  let session = sessions::get_session(db.pool(), &payload.session_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let checkpoint = sessions::get_session_message_checkpoint(
+    db.pool(),
+    &session.id,
+    payload.turn_id,
+  )
+  .await
+  .map_err(|err| err.to_string())?;
+  let Some(checkpoint) = checkpoint else {
+    return Err("Checkpoint not found for this turn".to_string());
+  };
+  if checkpoint.role != "user" {
+    return Err("Reset is only supported for user messages".to_string());
+  }
+  let Some(checkpoint_id) = checkpoint
+    .checkpoint_id
+    .filter(|value| !value.trim().is_empty())
+  else {
+    return Err("Checkpoint is unavailable for this turn".to_string());
+  };
+  let expected_workspace_id = session.workspace_id.clone();
+  let expected_status = session.status.clone();
+
+  let workspace_sessions = sessions::list_workspace_sessions(db.pool(), &session.workspace_id)
+    .await
+    .map_err(|err| err.to_string())?;
+  if workspace_sessions.iter().any(|item| {
+    item.id != session.id && matches!(item.status.as_str(), "running")
+  }) {
+    return Err("Another session is running in this workspace".to_string());
+  }
+
+  if matches!(session.status.as_str(), "running") {
+    sidecar
+      .cancel(&session.id, &session.agent_type)
+      .await?;
+  }
+  sidecar.close_session(&session.id).await;
+
+  let refreshed_session = sessions::get_session(db.pool(), &session.id)
+    .await
+    .map_err(|_| "Session no longer exists".to_string())?;
+  if refreshed_session.workspace_id != expected_workspace_id {
+    return Err("Session workspace changed".to_string());
+  }
+  if refreshed_session.status != expected_status {
+    return Err("Session status changed".to_string());
+  }
+  let refreshed_workspace = workspace::get_workspace(db.pool(), &expected_workspace_id)
+    .await
+    .map_err(|_| "Workspace no longer exists".to_string())?;
+  let next_turn_id = sessions::next_turn_id(db.pool(), &session.id)
+    .await
+    .map_err(|err| err.to_string())?;
+  let max_turn_id = next_turn_id.saturating_sub(1);
+  if payload.turn_id <= 0 || payload.turn_id > max_turn_id {
+    return Err("Invalid turn_id".to_string());
+  }
+  let refreshed_sessions =
+    sessions::list_workspace_sessions(db.pool(), &expected_workspace_id)
+      .await
+      .map_err(|err| err.to_string())?;
+  if refreshed_sessions.iter().any(|item| {
+    item.id != session.id && matches!(item.status.as_str(), "running")
+  }) {
+    return Err("Conflicting running session".to_string());
+  }
+
+  let workspace_path = PathBuf::from(&refreshed_workspace.path);
+  let rollback_checkpoint_id = {
+    let stamp = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map(|duration| duration.as_millis())
+      .unwrap_or(0);
+    format!("session-{}-turn-{}-rollback-{}", session.id, payload.turn_id, stamp)
+  };
+  // Create a rollback checkpoint so we can restore the current workspace if DB reset fails.
+  // This is best-effort: failure here should not block the reset attempt.
+  let rollback_checkpoint = match create_checkpoint(&workspace_path, &rollback_checkpoint_id) {
+    Ok(CheckpointOutcome::Created) => Some(rollback_checkpoint_id),
+    Ok(CheckpointOutcome::Skipped { reason }) => {
+      eprintln!(
+        "[checkpoint] rollback skipped for session {} turn {}: {}",
+        session.id, payload.turn_id, reason
+      );
+      None
+    }
+    Err(err) => {
+      eprintln!(
+        "[checkpoint] rollback checkpoint failed for session {} turn {}: {}",
+        session.id, payload.turn_id, err
+      );
+      None
+    }
+  };
+  // Restore the target checkpoint. If this fails, we must abort the reset.
+  restore_checkpoint(&workspace_path, &checkpoint_id).map_err(|err| err.to_string())?;
+  // Attempt DB reset. If it fails, try to restore the rollback checkpoint to avoid
+  // leaving the workspace and DB out of sync. Rollback failures are logged and may
+  // leave the workspace reverted while DB state remains unchanged.
+  if let Err(err) = sessions::reset_session_to_turn(db.pool(), &session.id, payload.turn_id).await
+  {
+    if let Some(rollback_id) = rollback_checkpoint.as_deref() {
+      if let Err(rollback_err) = restore_checkpoint(&workspace_path, rollback_id) {
+        eprintln!(
+          "[checkpoint] rollback restore failed for session {} turn {}: {}",
+          session.id, payload.turn_id, rollback_err
+        );
+      }
+      // Cleanup failure here leaves the rollback ref behind but does not affect workspace.
+      if let Err(cleanup_err) = delete_checkpoint(&workspace_path, rollback_id) {
+        eprintln!(
+          "[checkpoint] rollback cleanup failed for session {} turn {}: {}",
+          session.id, payload.turn_id, cleanup_err
+        );
+      }
+    }
+    return Err(format!(
+      "Reset failed after restoring checkpoint; workspace may be reverted: {err}"
+    ));
+  }
+  // Cleanup rollback checkpoint after successful DB reset. Failure leaves a stale ref.
+  if let Some(rollback_id) = rollback_checkpoint.as_deref() {
+    if let Err(cleanup_err) = delete_checkpoint(&workspace_path, rollback_id) {
+      eprintln!(
+        "[checkpoint] rollback cleanup failed for session {} turn {}: {}",
+        session.id, payload.turn_id, cleanup_err
+      );
+    }
+  }
+
+  Ok(())
 }
 
 #[allow(non_snake_case)]
@@ -2757,6 +2943,7 @@ fn main() {
       markWorkspaceUnread,
       sendSessionMessage,
       cancelSession,
+      resetSessionToTurn,
       updatePermissionMode,
       respondAskUserQuestion,
       respondExitPlanMode,
