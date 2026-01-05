@@ -101,7 +101,7 @@ fn parse_linked_workspace_ids(
     return Ok(None);
   }
   let parsed: Vec<String> = serde_json::from_str(trimmed).map_err(|err| {
-    DbError::InvalidPath(format!("Invalid linked workspace ids: {err}"))
+    DbError::Parse(format!("Invalid linked workspace ids JSON: {err}"))
   })?;
   Ok(Some(parsed))
 }

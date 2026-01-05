@@ -973,11 +973,18 @@ async fn sendSessionMessage(
       if !seen.insert(linked_id.clone()) {
         continue;
       }
-      let linked_workspace = workspace::get_workspace(db.pool(), &linked_id)
-        .await
-        .map_err(|err| err.to_string())?;
-      if linked_workspace.path != workspace_record.path {
-        additional_directories.push(linked_workspace.path);
+      match workspace::get_workspace(db.pool(), &linked_id).await {
+        Ok(linked_workspace) => {
+          if linked_workspace.path != workspace_record.path {
+            additional_directories.push(linked_workspace.path);
+          }
+        }
+        Err(err) => {
+          eprintln!(
+            "[sendSessionMessage] skipping linked workspace {}: {}",
+            linked_id, err
+          );
+        }
       }
     }
   }
@@ -2228,14 +2235,15 @@ fn ensure_context_dirs(workspace_path: &Path) -> Result<(), String> {
 fn validate_todos(items: &[ManualTodoItem]) -> Result<(), String> {
   let mut ids = HashSet::new();
   for item in items {
-    if item.id.trim().is_empty() {
+    let trimmed_id = item.id.trim();
+    if trimmed_id.is_empty() {
       return Err("Todo id is required.".to_string());
     }
     if item.text.trim().is_empty() {
       return Err("Todo text is required.".to_string());
     }
-    if !ids.insert(item.id.clone()) {
-      return Err(format!("Duplicate todo id: {}", item.id));
+    if !ids.insert(trimmed_id.to_string()) {
+      return Err(format!("Duplicate todo id: {}", trimmed_id));
     }
   }
   Ok(())

@@ -49,14 +49,15 @@ impl SpotlightManager {
     if workspace_path == repo_root {
       return Err("Spotlight requires a separate worktree path".to_string());
     }
-    {
-      let map = self.instances.lock().map_err(|_| "Spotlight state locked".to_string())?;
-      if map.contains_key(workspace_id) {
-        return Ok(());
-      }
-      if map.values().any(|item| item.repo_root == repo_root) {
-        return Err("Spotlight already active for this repository".to_string());
-      }
+    let mut map = self
+      .instances
+      .lock()
+      .map_err(|_| "Spotlight state locked".to_string())?;
+    if map.contains_key(workspace_id) {
+      return Ok(());
+    }
+    if map.values().any(|item| item.repo_root == repo_root) {
+      return Err("Spotlight already active for this repository".to_string());
     }
 
     let stamp = SystemTime::now()
@@ -76,9 +77,10 @@ impl SpotlightManager {
 
     let sync_checkpoint_id = format!("spotlight-sync-{}", workspace_id);
     let (trigger_tx, trigger_rx) = mpsc::channel::<()>();
+    let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_worker = stop_flag.clone();
-    let stop_flag_watcher = stop_flag_worker.clone();
+    let stop_flag_watcher = stop_flag.clone();
     let workspace_clone = workspace_path.clone();
     let repo_clone = repo_root.clone();
     let sync_id_clone = sync_checkpoint_id.clone();
@@ -99,16 +101,17 @@ impl SpotlightManager {
       }) {
         Ok(watcher) => watcher,
         Err(err) => {
-          eprintln!("[spotlight] watcher error: {err}");
+          let _ = init_tx.send(Err(format!("Spotlight watcher error: {err}")));
           return;
         }
       };
 
       if let Err(err) = watcher.watch(&workspace_clone, RecursiveMode::Recursive) {
-        eprintln!("[spotlight] failed to watch workspace: {err}");
+        let _ = init_tx.send(Err(format!("Spotlight failed to watch workspace: {err}")));
         return;
       }
 
+      let _ = init_tx.send(Ok(()));
       let _ = trigger_tx_worker.send(());
 
       loop {
@@ -129,6 +132,17 @@ impl SpotlightManager {
       }
     });
 
+    let init_result = init_rx
+      .recv_timeout(Duration::from_secs(3))
+      .map_err(|_| "Spotlight failed to initialize watcher".to_string())?;
+    if let Err(err) = init_result {
+      stop_flag.store(true, Ordering::Relaxed);
+      let _ = trigger_tx.send(());
+      let _ = join.join();
+      let _ = delete_checkpoint(&repo_root, &rollback_checkpoint_id);
+      return Err(err);
+    }
+
     let instance = SpotlightInstance {
       repo_root,
       rollback_checkpoint_id,
@@ -138,10 +152,6 @@ impl SpotlightManager {
       join: Some(join),
     };
 
-    let mut map = self
-      .instances
-      .lock()
-      .map_err(|_| "Spotlight state locked".to_string())?;
     map.insert(workspace_id.to_string(), instance);
     Ok(())
   }

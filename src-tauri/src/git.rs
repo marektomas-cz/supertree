@@ -397,9 +397,17 @@ pub fn branch_sync_status(path: &Path) -> Result<BranchSyncStatus, GitError> {
       for entry in inside.split(',') {
         let trimmed = entry.trim();
         if let Some(count) = trimmed.strip_prefix("ahead ") {
-          ahead = count.trim().parse::<i64>().unwrap_or(0);
+          let parsed = count.trim().parse::<i64>().unwrap_or(0);
+          if parsed == 0 && !count.trim().is_empty() {
+            eprintln!("Warning: Failed to parse ahead count: {}", count.trim());
+          }
+          ahead = parsed;
         } else if let Some(count) = trimmed.strip_prefix("behind ") {
-          behind = count.trim().parse::<i64>().unwrap_or(0);
+          let parsed = count.trim().parse::<i64>().unwrap_or(0);
+          if parsed == 0 && !count.trim().is_empty() {
+            eprintln!("Warning: Failed to parse behind count: {}", count.trim());
+          }
+          behind = parsed;
         }
       }
     }

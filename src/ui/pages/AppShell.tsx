@@ -524,10 +524,14 @@ const renderMarkdownContent = (
 };
 
 const EMPTY_TODOS: ManualTodoItem[] = [];
+const NOTES_TOKEN = '<notes>';
+const TODOS_TOKEN = '@todos';
+const NOTES_PLACEHOLDER = '__APP_NOTES_PLACEHOLDER__';
+const TODOS_PLACEHOLDER = '__APP_TODOS_PLACEHOLDER__';
 
 const buildNotesContext = (notes: string) => {
   const trimmed = notes.trim();
-  return `<notes>\n${trimmed || 'No notes yet.'}\n</notes>`;
+  return `${NOTES_TOKEN}\n${trimmed || 'No notes yet.'}\n</notes>`;
 };
 
 const buildTodosContext = (
@@ -2479,11 +2483,17 @@ export default function AppShell() {
     const draftAttachments = draftAttachmentsBySession[session.id] ?? [];
     const attachmentIds = draftAttachments.map((item) => item.id);
     let prompt = rawPrompt;
-    if (rawPrompt.includes('@todos')) {
-      prompt = prompt.replaceAll('@todos', todosContext);
+    if (prompt.includes(TODOS_TOKEN)) {
+      prompt = prompt.replace(TODOS_TOKEN, TODOS_PLACEHOLDER);
     }
-    if (rawPrompt.includes('<notes>')) {
-      prompt = prompt.replaceAll('<notes>', notesContext);
+    if (prompt.includes(NOTES_TOKEN)) {
+      prompt = prompt.replace(NOTES_TOKEN, NOTES_PLACEHOLDER);
+    }
+    if (prompt.includes(TODOS_PLACEHOLDER)) {
+      prompt = prompt.replace(TODOS_PLACEHOLDER, todosContext);
+    }
+    if (prompt.includes(NOTES_PLACEHOLDER)) {
+      prompt = prompt.replace(NOTES_PLACEHOLDER, notesContext);
     }
 
     try {
@@ -3796,6 +3806,9 @@ export default function AppShell() {
   const handleToggleLinkedWorkspace = useCallback(
     async (targetId: string, enabled: boolean) => {
       if (!activeWorkspaceId) {
+        return;
+      }
+      if (!activeWorkspace) {
         return;
       }
       const current = new Set(activeWorkspace?.linkedWorkspaceIds ?? []);

@@ -28,6 +28,11 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -41,11 +46,26 @@ jobs:
       - name: Install sidecar dependencies
         run: npm --prefix sidecar install
 
+      - name: Validate versions
+        run: node scripts/validate-versions.mjs
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Test frontend
+        run: npm run test
+
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
       - name: Build sidecar
         run: npm --prefix sidecar run build
 
       - name: Build and publish installers
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@action-v0.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
