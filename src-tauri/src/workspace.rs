@@ -149,11 +149,10 @@ pub async fn list_workspaces(pool: &SqlitePool) -> Result<Vec<WorkspaceRecord>, 
   )
   .fetch_all(pool)
   .await?;
-  let mut records = Vec::with_capacity(rows.len());
-  for row in rows {
-    records.push(row.into_record()?);
-  }
-  Ok(records)
+  rows
+    .into_iter()
+    .map(|row| row.into_record())
+    .collect::<Result<Vec<_>, DbError>>()
 }
 
 pub async fn get_workspace(pool: &SqlitePool, workspace_id: &str) -> Result<WorkspaceRecord, DbError> {

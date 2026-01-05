@@ -65,7 +65,7 @@ jobs:
         run: npm --prefix sidecar run build
 
       - name: Build and publish installers
-        uses: tauri-apps/tauri-action@action-v0.6.1
+        uses: tauri-apps/tauri-action@action-v0.6.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:

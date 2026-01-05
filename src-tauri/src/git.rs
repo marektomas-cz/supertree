@@ -394,6 +394,7 @@ pub fn branch_sync_status(path: &Path) -> Result<BranchSyncStatus, GitError> {
     let end = line.rfind(']').unwrap_or(line.len());
     if start + 1 < end {
       let inside = &line[start + 1..end];
+      let upstream_gone = inside.to_lowercase().contains("gone");
       for entry in inside.split(',') {
         let trimmed = entry.trim();
         if let Some(count) = trimmed.strip_prefix("ahead ") {
@@ -409,6 +410,11 @@ pub fn branch_sync_status(path: &Path) -> Result<BranchSyncStatus, GitError> {
           }
           behind = parsed;
         }
+      }
+      if upstream_gone {
+        upstream = None;
+        ahead = 0;
+        behind = 0;
       }
     }
   }

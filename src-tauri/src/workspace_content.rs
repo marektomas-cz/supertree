@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const NOTES_FILE_NAME: &str = "notes.md";
 const TODOS_FILE_NAME: &str = "todos.json";
@@ -87,7 +90,8 @@ fn write_atomic(path: &Path, contents: &[u8], label: &str) -> Result<(), String>
     .duration_since(UNIX_EPOCH)
     .map_err(|err| format!("Failed to write {label}: {err}"))?
     .as_nanos();
-  let tmp_path = parent.join(format!("{file_name}.tmp.{stamp}"));
+  let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+  let tmp_path = parent.join(format!("{file_name}.tmp.{stamp}.{counter}"));
 
   let mut file = fs::File::create(&tmp_path)
     .map_err(|err| format!("Failed to write {label}: {err}"))?;

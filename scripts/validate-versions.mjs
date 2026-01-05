@@ -8,7 +8,15 @@ const readJson = (filePath) => {
 
 const readCargoVersion = (filePath) => {
   const raw = fs.readFileSync(filePath, 'utf8');
-  const match = raw.match(/^version\s*=\s*\"([^\"]+)\"/m);
+  const headerMatch = raw.match(/^\s*\[package\]\s*$/m);
+  if (!headerMatch || headerMatch.index === undefined) {
+    throw new Error(`Missing [package] section in ${filePath}`);
+  }
+  const afterHeader = raw.slice(headerMatch.index + headerMatch[0].length);
+  const nextHeaderIndex = afterHeader.search(/^\s*\[[^\]]+\]\s*$/m);
+  const packageBlock =
+    nextHeaderIndex === -1 ? afterHeader : afterHeader.slice(0, nextHeaderIndex);
+  const match = packageBlock.match(/^\s*version\s*=\s*"([^"]+)"/m);
   if (!match) {
     throw new Error(`Missing version in ${filePath}`);
   }
