@@ -6982,7 +6982,6 @@ export default function AppShell() {
         </div>
       ) : null}
       </div>
-      </div>
       </>
     </TooltipProvider>
   );
