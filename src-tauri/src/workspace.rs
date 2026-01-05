@@ -377,19 +377,19 @@ pub async fn set_workspace_linked_workspace_ids(
     Some(raw) => {
       let trimmed = raw.trim();
       if trimmed.is_empty() {
-        return Err(DbError::Parse(
-          "Linked workspace ids JSON is empty".to_string(),
-        ));
+        None
+      } else {
+        let parsed: Vec<String> =
+          serde_json::from_str(trimmed).map_err(|err| {
+            DbError::Parse(format!("Invalid linked workspace ids JSON: {err}"))
+          })?;
+        let normalized = serde_json::to_string(&parsed).map_err(|err| {
+          DbError::Parse(format!(
+            "Failed to serialize linked workspace ids JSON: {err}"
+          ))
+        })?;
+        Some(normalized)
       }
-      let parsed: Vec<String> = serde_json::from_str(trimmed).map_err(|err| {
-        DbError::Parse(format!("Invalid linked workspace ids JSON: {err}"))
-      })?;
-      let normalized = serde_json::to_string(&parsed).map_err(|err| {
-        DbError::Parse(format!(
-          "Failed to serialize linked workspace ids JSON: {err}"
-        ))
-      })?;
-      Some(normalized)
     }
   };
   let result = sqlx::query(

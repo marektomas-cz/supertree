@@ -72,3 +72,4 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: Supertree ${{ github.ref_name }}
           releaseBody: Installers for ${{ github.ref_name }}.
+          prerelease: ${{ contains(github.ref_name, '-') }}

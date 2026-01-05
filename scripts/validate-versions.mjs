@@ -40,4 +40,24 @@ if (unique.size !== 1) {
   process.exit(1);
 }
 
-console.log(`All versions match: ${[...unique][0]}`);
+const version = [...unique][0];
+const tagSource =
+  process.env.GITHUB_REF_NAME || process.env.GITHUB_REF || process.env.GITHUB_TAG;
+if (tagSource) {
+  const ref = tagSource.startsWith('refs/tags/')
+    ? tagSource.slice('refs/tags/'.length)
+    : tagSource;
+  const normalizedTag = ref.startsWith('v') ? ref.slice(1) : ref;
+  if (!normalizedTag) {
+    console.error(`Invalid tag value: "${tagSource}"`);
+    process.exit(1);
+  }
+  if (normalizedTag !== version) {
+    console.error(
+      `Tag version mismatch: tag=${normalizedTag}, project=${version}`
+    );
+    process.exit(1);
+  }
+}
+
+console.log(`All versions match: ${version}`);
