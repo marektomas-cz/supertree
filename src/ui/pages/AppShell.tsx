@@ -2094,7 +2094,9 @@ export default function AppShell() {
     };
   }, []);
 
-  const isTauriApp = typeof window !== 'undefined' && '__TAURI__' in window;
+  const isTauriApp =
+    typeof window !== 'undefined' &&
+    ('__TAURI_INTERNALS__' in window || '__TAURI__' in window);
 
   const handleWindowMinimize = async () => {
     if (!isTauriApp) {
